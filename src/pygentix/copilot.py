@@ -12,7 +12,7 @@ __all__ = ["Copilot"]
 class Copilot(Agent):
     """Agent backed by `Azure OpenAI <https://azure.microsoft.com/products/ai-services/openai-service>`_.
 
-    Uses the same wire protocol as :class:`~agentic.chatgpt.ChatGPT` but
+    Uses the same wire protocol as :class:`~pygentix.chatgpt.ChatGPT` but
     routes requests through your Azure OpenAI deployment, which is the
     engine behind Microsoft Copilot.
 

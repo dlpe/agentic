@@ -1,16 +1,16 @@
-# agentic
+# pygentix
 
 A composable Python framework for building AI agents with **tool-calling**, **structured output**, and **SQLAlchemy integration** — across any LLM provider.
 
 ```
-pip install agentic                    # core only
-pip install agentic[ollama]            # + Ollama backend
-pip install agentic[openai]            # + OpenAI (ChatGPT) backend
-pip install agentic[gemini]            # + Google Gemini backend
-pip install agentic[all]               # every backend
+pip install pygentix                    # core only
+pip install pygentix[ollama]            # + Ollama backend
+pip install pygentix[openai]            # + OpenAI (ChatGPT) backend
+pip install pygentix[gemini]            # + Google Gemini backend
+pip install pygentix[all]               # every backend
 ```
 
-> **Azure OpenAI / Copilot** uses the `openai` package — install `agentic[openai]`.
+> **Azure OpenAI / Copilot** uses the `openai` package — install `pygentix[openai]`.
 
 ---
 
@@ -19,9 +19,9 @@ pip install agentic[all]               # every backend
 Pick a backend, register tools, and start a conversation:
 
 ```python
-from agentic import ChatGPT
+from pygentix import Ollama
 
-agent = ChatGPT(model="gpt-4o-mini")          # or Ollama, Gemini, Copilot
+agent = Ollama(model="qwen2.5:7b")            # runs locally — no API key needed
 
 @agent.uses
 def get_weather(city: str) -> str:
@@ -34,7 +34,15 @@ print(response.message.content)
 # → "It's sunny and 22 °C in Paris right now."
 ```
 
-Every backend returns the same `ChatResponse` object, so switching providers is a one-line change.
+Every backend returns the same `ChatResponse` object, so switching providers is a one-line change:
+
+```python
+from pygentix import ChatGPT, Gemini, Copilot
+
+agent = ChatGPT(model="gpt-4o-mini")          # OpenAI
+agent = Gemini(model="gemini-2.5-flash")       # Google
+agent = Copilot(model="gpt-4o")               # Azure OpenAI
+```
 
 ---
 
@@ -49,20 +57,20 @@ Every backend returns the same `ChatResponse` object, so switching providers is 
 
 ### API keys
 
-Each backend reads its key from the environment (or accepts it in the constructor):
+Cloud backends read their key from the environment (or accept it in the constructor). Ollama runs locally and needs no key.
 
 | Backend | Environment variable | Constructor kwarg |
 |---|---|---|
+| `Ollama` | *(none — runs locally)* | — |
 | `ChatGPT` | `OPENAI_API_KEY` | `api_key` |
 | `Gemini` | `GEMINI_API_KEY` | `api_key` |
 | `Copilot` | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` | `api_key`, `endpoint` |
-| `Ollama` | *(none — runs locally)* | — |
 
 ```python
-from agentic import Gemini
+from pygentix import ChatGPT
 
-agent = Gemini(api_key="sk-...")           # explicit
-agent = Gemini()                            # reads GEMINI_API_KEY
+agent = ChatGPT(api_key="sk-...")              # explicit
+agent = ChatGPT()                              # reads OPENAI_API_KEY
 ```
 
 ---
@@ -72,6 +80,10 @@ agent = Gemini()                            # reads GEMINI_API_KEY
 Decorate any Python function with `@agent.uses` to expose it as a tool the LLM can invoke:
 
 ```python
+from pygentix import Ollama
+
+agent = Ollama()
+
 @agent.uses
 def search_docs(query: str) -> str:
     """Search the documentation for relevant articles."""
@@ -81,9 +93,38 @@ def search_docs(query: str) -> str:
 def send_email(to: str, subject: str, body: str) -> str:
     """Send an email to the specified address."""
     return mailer.send(to, subject, body)
+
+conv = agent.start_conversation()
+response = conv.ask("Find docs about authentication and email them to alice@co.com")
 ```
 
 The framework introspects the function's signature and docstring to build the tool definition automatically. When the model decides to call a tool, the framework executes it and feeds the result back — looping until the model produces a final answer.
+
+---
+
+## Vision / Image Understanding
+
+Pass images alongside your question to any vision-capable model:
+
+```python
+from pygentix import Ollama
+
+agent = Ollama(model="llama3.2-vision")        # local vision model
+conv = agent.start_conversation()
+
+response = conv.ask("How many cats are in this photo?", images=["photo.jpeg"])
+print(response.message.content)
+# → "There are 3 cats in the photo."
+```
+
+The `images` parameter accepts a list of file paths and works across all backends:
+
+| Backend | Vision model examples |
+|---|---|
+| `Ollama` | `llama3.2-vision`, `moondream` |
+| `ChatGPT` | `gpt-4o`, `gpt-4o-mini` |
+| `Gemini` | `gemini-2.5-flash`, `gemini-2.5-pro` |
+| `Copilot` | `gpt-4o` (via Azure) |
 
 ---
 
@@ -92,9 +133,9 @@ The framework introspects the function's signature and docstring to build the to
 Use `OutputAgent` to guarantee responses follow a JSON schema:
 
 ```python
-from agentic import ChatGPT, OutputAgent
+from pygentix import Ollama, OutputAgent
 
-class MyAgent(ChatGPT, OutputAgent):
+class MyAgent(Ollama, OutputAgent):
     pass
 
 agent = MyAgent()
@@ -125,7 +166,7 @@ The schema can also be a raw dict — pass any valid JSON Schema to `agent.outpu
 from sqlalchemy import Column, Integer, String, create_engine
 from sqlalchemy.orm import declarative_base
 
-from agentic import ChatGPT, OutputAgent, SqlAlchemyAgent
+from pygentix import Ollama, OutputAgent, SqlAlchemyAgent
 
 Base = declarative_base()
 
@@ -138,7 +179,7 @@ class Product(Base):
 engine = create_engine("sqlite:///shop.db")
 Base.metadata.create_all(engine)
 
-class ShopAgent(ChatGPT, SqlAlchemyAgent, OutputAgent):
+class ShopAgent(Ollama, SqlAlchemyAgent, OutputAgent):
     pass
 
 agent = ShopAgent(engine=engine)
@@ -168,12 +209,15 @@ The agent automatically generates `run_query`, `run_insert`, `run_update`, and `
 Every agent is a composable mixin — swap the backend class and everything else stays the same:
 
 ```python
-from agentic import Ollama, Gemini, Copilot, SqlAlchemyAgent, OutputAgent
+from pygentix import Ollama, ChatGPT, Gemini, Copilot, SqlAlchemyAgent, OutputAgent
 
 class LocalAgent(Ollama, SqlAlchemyAgent, OutputAgent):
     """Runs entirely on your machine via Ollama."""
 
-class CloudAgent(Gemini, SqlAlchemyAgent, OutputAgent):
+class CloudAgent(ChatGPT, SqlAlchemyAgent, OutputAgent):
+    """Uses OpenAI for inference."""
+
+class GoogleAgent(Gemini, SqlAlchemyAgent, OutputAgent):
     """Uses Google Gemini for inference."""
 
 class EnterpriseAgent(Copilot, SqlAlchemyAgent, OutputAgent):
@@ -187,6 +231,11 @@ class EnterpriseAgent(Copilot, SqlAlchemyAgent, OutputAgent):
 A `Conversation` maintains the full message history, so follow-up questions have context:
 
 ```python
+from pygentix import Ollama, SqlAlchemyAgent
+
+# ... define models, engine, etc.
+
+agent = Ollama(engine=engine)
 conv = agent.start_conversation()
 conv.ask("Create a user named Alice with email alice@example.com")
 conv.ask("Now create one for Bob at bob@example.com")
@@ -227,8 +276,8 @@ response = conv.ask("List all users")
 ## Development
 
 ```bash
-git clone https://github.com/andreperussi/agentic.git
-cd agentic
+git clone https://github.com/andreperussi/pygentix.git
+cd pygentix
 pip install -e ".[dev]"
 pytest
 ```

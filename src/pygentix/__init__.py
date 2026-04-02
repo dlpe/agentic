@@ -1,4 +1,4 @@
-"""Composable AI agent framework with tool-calling, structured output, and SQLAlchemy integration."""
+"""pygentix — Composable AI agent framework with tool-calling, structured output, and SQLAlchemy integration."""
 
 from .core import Agent, ChatResponse, Conversation, Function
 from .ollama import Ollama

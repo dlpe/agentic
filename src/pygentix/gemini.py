@@ -1,5 +1,6 @@
 """Google Gemini LLM backend for agents."""
 
+import mimetypes
 import os
 from typing import Any
 
@@ -129,7 +130,13 @@ class Gemini(Agent):
     def _user_content(msg: dict) -> Any:
         from google.genai import types
 
-        return types.Content(role="user", parts=[types.Part(text=msg["content"])])
+        parts = [types.Part(text=msg["content"])]
+        for img_path in msg.get("images") or []:
+            mime = mimetypes.guess_type(img_path)[0] or "image/jpeg"
+            with open(img_path, "rb") as f:
+                parts.append(types.Part.from_bytes(data=f.read(), mime_type=mime))
+
+        return types.Content(role="user", parts=parts)
 
     @staticmethod
     def _model_content(msg: dict) -> Any:

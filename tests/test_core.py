@@ -1,8 +1,8 @@
-"""Tests for agentic.core — Function, Conversation, and Agent."""
+"""Tests for pygentix.core — Function, Conversation, and Agent."""
 
 from unittest.mock import MagicMock
 
-from agentic.core import Conversation, Function
+from pygentix.core import Conversation, Function
 
 
 # -- Function --------------------------------------------------------------

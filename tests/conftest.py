@@ -5,7 +5,7 @@ from sqlalchemy import Column, ForeignKey, create_engine
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.types import Boolean, Date, DateTime, Float, Integer, String
 
-from agentic.sqlalchemy import SqlAlchemyAgent
+from pygentix.sqlalchemy import SqlAlchemyAgent
 
 Base = declarative_base()
 

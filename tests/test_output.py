@@ -1,10 +1,10 @@
-"""Tests for agentic.output — OutputAgent schema generation and parsing."""
+"""Tests for pygentix.output — OutputAgent schema generation and parsing."""
 
 import pytest
 from unittest.mock import MagicMock
 
-from agentic.output import OutputAgent
-from agentic.sqlalchemy import SqlAlchemyAgent
+from pygentix.output import OutputAgent
+from pygentix.sqlalchemy import SqlAlchemyAgent
 from tests.conftest import Author
 
 

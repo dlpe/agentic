@@ -12,7 +12,7 @@ from sqlalchemy import Column, ForeignKey, create_engine
 from sqlalchemy.orm import Session, declarative_base, relationship
 from sqlalchemy.types import Date, Float, Integer, String
 
-from agentic import Ollama, OutputAgent, SqlAlchemyAgent
+from pygentix import Ollama, OutputAgent, SqlAlchemyAgent
 
 Base = declarative_base()
 

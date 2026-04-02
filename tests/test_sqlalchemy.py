@@ -1,11 +1,11 @@
-"""Tests for agentic.sqlalchemy — SqlAlchemyAgent CRUD, coercion, and query building."""
+"""Tests for pygentix.sqlalchemy — SqlAlchemyAgent CRUD, coercion, and query building."""
 
 import pytest
 from datetime import date, datetime
 from sqlalchemy.orm import Session
 
-from agentic.core import Function
-from agentic.sqlalchemy import describe_model
+from pygentix.core import Function
+from pygentix.sqlalchemy import describe_model
 from tests.conftest import Author, Book, Event, StubSqlAgent
 
 

@@ -170,9 +170,26 @@ class Conversation:
 
     # -- public API --------------------------------------------------------
 
-    def ask(self, question: str, max_retries: int = 3) -> ChatResponse:
-        """Send *question* and return the model's response."""
-        self.messages.append({"role": "user", "content": question})
+    def ask(
+        self,
+        question: str,
+        images: list[str] | None = None,
+        max_retries: int = 3,
+    ) -> ChatResponse:
+        """Send *question* and return the model's response.
+
+        Parameters
+        ----------
+        images:
+            Optional list of image file paths to include with the question.
+            Supported by vision-capable models (e.g. ``llama3.2-vision``
+            via Ollama, ``gpt-4o`` via ChatGPT, ``gemini-2.5-flash`` via
+            Gemini).
+        """
+        msg: dict[str, Any] = {"role": "user", "content": question}
+        if images:
+            msg["images"] = images
+        self.messages.append(msg)
 
         response = self._prompt_until_actionable(max_retries)
         response = self._execute_tool_calls(response)
