@@ -5,7 +5,7 @@ from functools import wraps
 import inspect
 from typing import Any, Callable
 
-__all__ = ["Function", "Conversation", "Agent"]
+__all__ = ["Function", "ChatResponse", "Conversation", "Agent"]
 
 _DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful agent. "
@@ -17,6 +17,67 @@ _DEFAULT_SYSTEM_PROMPT = (
 )
 
 _TOOL_NUDGE = "Don't describe what you will do. Call the appropriate tool now."
+
+_PYTHON_TO_JSON_TYPE: dict[type, str] = {
+    str: "string", int: "integer", float: "number",
+    bool: "boolean", list: "array", dict: "object",
+}
+
+
+# -- Response types --------------------------------------------------------
+
+
+class _FunctionCall:
+    """Name + arguments of a single function invocation."""
+    __slots__ = ("name", "arguments")
+
+    def __init__(self, name: str, arguments: dict) -> None:
+        self.name = name
+        self.arguments = arguments
+
+
+class _ToolCall:
+    """A tool call requested by the model, optionally carrying a provider ID."""
+    __slots__ = ("id", "function")
+
+    def __init__(self, name: str, arguments: dict, id: str | None = None) -> None:
+        self.id = id
+        self.function = _FunctionCall(name, arguments)
+
+
+class _Message:
+    __slots__ = ("content", "tool_calls")
+
+    def __init__(self, content: str, tool_calls: list[_ToolCall] | None) -> None:
+        self.content = content
+        self.tool_calls = tool_calls
+
+
+class ChatResponse:
+    """Normalized response that all LLM backends return.
+
+    Provides a uniform interface so :class:`Conversation` can drive any
+    backend without caring which provider produced the response::
+
+        response.message.content        # str
+        response.message.tool_calls     # list[ToolCall] | None
+        call.function.name              # str
+        call.function.arguments         # dict
+        call.id                         # str | None  (provider-specific)
+    """
+    __slots__ = ("message",)
+
+    def __init__(self, content: str = "", tool_calls: list[dict] | None = None) -> None:
+        parsed = None
+        if tool_calls:
+            parsed = [
+                _ToolCall(tc["name"], tc["arguments"], tc.get("id"))
+                for tc in tool_calls
+            ]
+        self.message = _Message(content, parsed)
+
+
+# -- Function wrapper ------------------------------------------------------
 
 
 class Function:
@@ -55,6 +116,39 @@ class Function:
     def __repr__(self) -> str:
         return f"Function({self.name})"
 
+    def to_tool_schema(self) -> dict:
+        """Generate an OpenAI-compatible tool definition for this function."""
+        properties: dict[str, dict] = {}
+        required: list[str] = []
+
+        for param_name, param in self.parameters.items():
+            if param_name == "self":
+                continue
+            annotation = param.annotation
+            json_type = _PYTHON_TO_JSON_TYPE.get(
+                annotation if annotation is not inspect.Parameter.empty else str,
+                "string",
+            )
+            properties[param_name] = {"type": json_type}
+            if param.default is inspect.Parameter.empty:
+                required.append(param_name)
+
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.docs or "",
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+            },
+        }
+
+
+# -- Conversation ----------------------------------------------------------
+
 
 class Conversation:
     """Manages a multi-turn conversation between a user and an agent.
@@ -76,7 +170,7 @@ class Conversation:
 
     # -- public API --------------------------------------------------------
 
-    def ask(self, question: str, max_retries: int = 3) -> Any:
+    def ask(self, question: str, max_retries: int = 3) -> ChatResponse:
         """Send *question* and return the model's response."""
         self.messages.append({"role": "user", "content": question})
 
@@ -89,7 +183,7 @@ class Conversation:
 
     # -- private helpers ---------------------------------------------------
 
-    def _prompt_until_actionable(self, max_retries: int) -> Any:
+    def _prompt_until_actionable(self, max_retries: int) -> ChatResponse:
         """Prompt the model, retrying with a nudge if it narrates instead of acting."""
         for attempt in range(max_retries):
             response = self.agent.chat(messages=self.messages)
@@ -110,10 +204,17 @@ class Conversation:
 
         return response  # pragma: no cover — loop always returns
 
-    def _execute_tool_calls(self, response: Any) -> Any:
+    def _execute_tool_calls(self, response: ChatResponse) -> ChatResponse:
         """Execute tool calls in a loop until the model stops requesting them."""
         while response.message.tool_calls:
-            self.messages.append({"role": "assistant", "content": response.message.content})
+            self.messages.append({
+                "role": "assistant",
+                "content": response.message.content,
+                "tool_calls": [
+                    {"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments}
+                    for tc in response.message.tool_calls
+                ],
+            })
 
             for call in response.message.tool_calls:
                 try:
@@ -128,6 +229,7 @@ class Conversation:
                 self.messages.append({
                     "role": "tool",
                     "tool_name": call.function.name,
+                    "tool_call_id": call.id,
                     "content": result,
                 })
 
@@ -135,7 +237,7 @@ class Conversation:
 
         return response
 
-    def _apply_output_schema(self, response: Any) -> Any:
+    def _apply_output_schema(self, response: ChatResponse) -> ChatResponse:
         """Re-prompt with a format constraint if the agent defines an output schema."""
         schema = getattr(self.agent, "output_schema", None)
         if schema:
@@ -150,6 +252,9 @@ class Conversation:
             if msg["role"] == "user":
                 return False
         return False
+
+
+# -- Agent -----------------------------------------------------------------
 
 
 class Agent(ABC):
@@ -177,8 +282,8 @@ class Agent(ABC):
         return wrapped
 
     @abstractmethod
-    def chat(self, messages: list[dict], **kwargs: Any) -> Any:
-        """Send *messages* to the model and return its response."""
+    def chat(self, messages: list[dict], **kwargs: Any) -> ChatResponse:
+        """Send *messages* to the model and return a :class:`ChatResponse`."""
         ...
 
     def start_conversation(self, system: str = _DEFAULT_SYSTEM_PROMPT) -> Conversation:

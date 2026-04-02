@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from .core import Agent
+from .core import Agent, ChatResponse
 
 __all__ = ["Ollama"]
 
@@ -33,14 +33,26 @@ class Ollama(Agent):
         if self.model not in installed:
             ollama_pull(self.model)
 
-    def chat(self, messages: list[dict], **kwargs: Any) -> Any:
-        """Forward *messages* to the Ollama model and return its response."""
+    def chat(self, messages: list[dict], **kwargs: Any) -> ChatResponse:
+        """Forward *messages* to the Ollama model and return a :class:`ChatResponse`."""
         from ollama import chat as ollama_chat
 
         fmt = kwargs.pop("format", None)
-        return ollama_chat(
+        response = ollama_chat(
             model=self.model,
             messages=messages,
             tools=list(self.functions.values()),
             **({"format": fmt} if fmt else {}),
+        )
+
+        tool_calls = None
+        if response.message.tool_calls:
+            tool_calls = [
+                {"name": tc.function.name, "arguments": tc.function.arguments}
+                for tc in response.message.tool_calls
+            ]
+
+        return ChatResponse(
+            content=response.message.content or "",
+            tool_calls=tool_calls,
         )

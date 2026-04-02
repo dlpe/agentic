@@ -29,8 +29,17 @@ dependencies = [
 
 [project.optional-dependencies]
 ollama = ["ollama>=0.4"]
+openai = ["openai>=1.0"]
+gemini = ["google-genai>=1.0"]
+all = [
+    "ollama>=0.4",
+    "openai>=1.0",
+    "google-genai>=1.0",
+]
 dev = [
     "ollama>=0.4",
+    "openai>=1.0",
+    "google-genai>=1.0",
     "pytest>=8.0",
 ]
 

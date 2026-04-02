@@ -190,7 +190,7 @@ class TestIntegration:
         )
 
     def test_batch_create_sales(self, setup):
-        """Asking for 10 new sales should create at least 2 additional rows."""
+        """Asking for 10 new sales should create at least 10 additional rows."""
         agent, engine, conv = setup
 
         conv.ask("Create a new customer named 'Acme Corp' with email 'acme@example.com'")
@@ -206,8 +206,8 @@ class TestIntegration:
             after = s.query(Sale).count()
 
         assert after > before, "No new sales were created"
-        assert after - before >= 2, (
-            f"Expected at least 2 new sales, got {after - before}"
+        assert after - before >= 10, (
+            f"Expected at least 10 new sales, got {after - before}"
         )
 
     def test_update_sale(self, setup):
@@ -221,7 +221,7 @@ class TestIntegration:
         conv.ask("Update the sale with id '1' to amount '200.00'")
 
         with Session(engine) as s:
-            sale = s.query(Sale).get(1)
+            sale = s.get(Sale, 1)
         assert sale is not None, "Sale #1 not found"
         assert sale.amount == pytest.approx(200.0), (
             f"Expected amount 200.0, got {sale.amount}"
