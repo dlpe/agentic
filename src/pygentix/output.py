@@ -37,7 +37,7 @@ class OutputAgent(Agent):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.output_schema: dict | None = None
-        self._output_cls: type | None = None
+        self.output_cls: type | None = None
 
     # -- public API --------------------------------------------------------
 
@@ -46,8 +46,8 @@ class OutputAgent(Agent):
         if isinstance(schema, dict):
             self.output_schema = schema
         else:
-            self._output_cls = schema
-            self.output_schema = self._schema_from_class(schema)
+            self.output_cls = schema
+            self.output_schema = self.schema_from_class(schema)
         return schema
 
     def parse_output(self, response: Any) -> Any:
@@ -60,13 +60,13 @@ class OutputAgent(Agent):
         except (json.JSONDecodeError, TypeError):
             return response.message.content
 
-        if not self._output_cls:
+        if not self.output_cls:
             return data
 
         try:
-            return self._output_cls(**data)
+            return self.output_cls(**data)
         except TypeError:
-            obj = object.__new__(self._output_cls)
+            obj = object.__new__(self.output_cls)
             for key, value in data.items():
                 setattr(obj, key, value)
             return obj
@@ -86,21 +86,21 @@ class OutputAgent(Agent):
     # -- schema generation -------------------------------------------------
 
     @classmethod
-    def _type_to_json(cls, tp: type) -> dict:
+    def type_to_json(cls, tp: type) -> dict:
         """Convert a Python type annotation to a JSON-schema fragment."""
         origin = get_origin(tp)
         if origin is list:
             args = get_args(tp)
-            return {"type": "array", "items": cls._type_to_json(args[0]) if args else {}}
+            return {"type": "array", "items": cls.type_to_json(args[0]) if args else {}}
         if origin is dict:
             return {"type": "object"}
         return {"type": cls.PYTHON_TO_JSON.get(tp, "string")}
 
     @classmethod
-    def _schema_from_class(cls, klass: type) -> dict:
+    def schema_from_class(cls, klass: type) -> dict:
         """Derive a JSON schema from a class's type annotations."""
         hints = get_type_hints(klass)
-        properties = {name: cls._type_to_json(tp) for name, tp in hints.items()}
+        properties = {name: cls.type_to_json(tp) for name, tp in hints.items()}
         class_vars = vars(klass)
         required = [name for name in hints if name not in class_vars]
         return {"type": "object", "properties": properties, "required": required}

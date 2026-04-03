@@ -1,19 +1,19 @@
 """Google Gemini LLM backend for agents."""
 
+import logging
 import mimetypes
 import os
-from typing import Any
+from typing import Any, Iterator
 
-from .core import Agent, ChatResponse
+from .core import Agent, ChatResponse, Usage
 
 __all__ = ["Gemini"]
+
+logger = logging.getLogger("pygentix")
 
 
 class Gemini(Agent):
     """Agent backed by the `Google Gemini <https://ai.google.dev>`_ API.
-
-    Works with any Gemini chat model (``gemini-2.5-flash``,
-    ``gemini-2.5-pro``, etc.).
 
     Parameters
     ----------
@@ -22,6 +22,10 @@ class Gemini(Agent):
     api_key:
         Google AI API key.  Falls back to the ``GEMINI_API_KEY`` environment
         variable when not provided.
+    temperature:
+        Sampling temperature.  Defaults to ``0`` for deterministic output.
+    top_k:
+        Top-k sampling.  Defaults to ``1`` for deterministic output.
     """
 
     def __init__(
@@ -29,21 +33,24 @@ class Gemini(Agent):
         model: str = "gemini-2.5-flash",
         *,
         api_key: str | None = None,
+        temperature: float = 0,
+        top_k: int = 1,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.model = model
-        self._api_key = api_key or os.environ.get("GEMINI_API_KEY")
-        self._client: Any = None
+        self.temperature = temperature
+        self.top_k = top_k
+        self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
+        self.client: Any = None
 
-    @property
-    def client(self) -> Any:
-        """Lazy-initialised Google GenAI client."""
-        if self._client is None:
+    def ensure_client(self) -> Any:
+        """Return the Google GenAI client, creating it on first use."""
+        if self.client is None:
             from google import genai
 
-            self._client = genai.Client(api_key=self._api_key)
-        return self._client
+            self.client = genai.Client(api_key=self.api_key)
+        return self.client
 
     # -- chat --------------------------------------------------------------
 
@@ -51,12 +58,14 @@ class Gemini(Agent):
         """Forward *messages* to the Gemini API and return a :class:`ChatResponse`."""
         from google.genai import types
 
-        contents, system_instruction = self._prepare_contents(messages)
-        tools = self._build_tools()
+        contents, system_instruction = self.prepare_contents(messages)
+        tools = self.build_tools()
 
         fmt = kwargs.pop("format", None)
         config = types.GenerateContentConfig(
             tools=tools,
+            temperature=self.temperature,
+            top_k=self.top_k,
             **({"system_instruction": system_instruction} if system_instruction else {}),
             **(
                 {
@@ -68,17 +77,39 @@ class Gemini(Agent):
             ),
         )
 
-        response = self.client.models.generate_content(
+        def do_call() -> Any:
+            return self.ensure_client().models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=config,
+            )
+
+        response = self.with_retry(do_call)
+        return self.parse_response(response)
+
+    def chat_stream(self, messages: list[dict], **kwargs: Any) -> Iterator[str]:
+        """Yield content chunks via Gemini's native streaming."""
+        from google.genai import types
+
+        contents, system_instruction = self.prepare_contents(messages)
+        config = types.GenerateContentConfig(
+            temperature=self.temperature,
+            top_k=self.top_k,
+            **({"system_instruction": system_instruction} if system_instruction else {}),
+        )
+
+        stream = self.ensure_client().models.generate_content_stream(
             model=self.model,
             contents=contents,
             config=config,
         )
-
-        return self._parse_response(response)
+        for chunk in stream:
+            if chunk.text:
+                yield chunk.text
 
     # -- internals ---------------------------------------------------------
 
-    def _build_tools(self) -> list | None:
+    def build_tools(self) -> list | None:
         """Convert registered functions to Gemini tool declarations."""
         if not self.functions:
             return None
@@ -98,7 +129,7 @@ class Gemini(Agent):
 
         return [types.Tool(function_declarations=declarations)]
 
-    def _prepare_contents(self, messages: list[dict]) -> tuple[list, str | None]:
+    def prepare_contents(self, messages: list[dict]) -> tuple[list, str | None]:
         """Transform internal messages to the Gemini *contents* format.
 
         Returns ``(contents_list, system_instruction)``.
@@ -114,11 +145,11 @@ class Gemini(Agent):
             if role == "system":
                 system_instruction = msg["content"]
             elif role == "user":
-                contents.append(self._user_content(msg))
+                contents.append(self.user_content(msg))
             elif role == "assistant":
-                contents.append(self._model_content(msg))
+                contents.append(self.model_content(msg))
             elif role == "tool":
-                content, i = self._tool_contents(messages, i)
+                content, i = self.tool_contents(messages, i)
                 contents.append(content)
                 continue
 
@@ -127,7 +158,7 @@ class Gemini(Agent):
         return contents, system_instruction
 
     @staticmethod
-    def _user_content(msg: dict) -> Any:
+    def user_content(msg: dict) -> Any:
         from google.genai import types
 
         parts = [types.Part(text=msg["content"])]
@@ -139,7 +170,7 @@ class Gemini(Agent):
         return types.Content(role="user", parts=parts)
 
     @staticmethod
-    def _model_content(msg: dict) -> Any:
+    def model_content(msg: dict) -> Any:
         from google.genai import types
 
         if msg.get("tool_calls"):
@@ -161,7 +192,7 @@ class Gemini(Agent):
         )
 
     @staticmethod
-    def _tool_contents(messages: list[dict], i: int) -> tuple[Any, int]:
+    def tool_contents(messages: list[dict], i: int) -> tuple[Any, int]:
         """Collect consecutive tool messages into a single Gemini Content."""
         from google.genai import types
 
@@ -179,13 +210,22 @@ class Gemini(Agent):
         return types.Content(role="user", parts=parts), i
 
     @staticmethod
-    def _parse_response(response: Any) -> ChatResponse:
+    def parse_response(response: Any) -> ChatResponse:
         """Convert a Gemini ``GenerateContentResponse`` into a :class:`ChatResponse`."""
         content = ""
         tool_calls: list[dict] | None = None
 
+        meta = getattr(response, "usage_metadata", None)
+        usage = Usage()
+        if meta:
+            usage = Usage(
+                prompt_tokens=getattr(meta, "prompt_token_count", 0) or 0,
+                completion_tokens=getattr(meta, "candidates_token_count", 0) or 0,
+                total_tokens=getattr(meta, "total_token_count", 0) or 0,
+            )
+
         if not response.candidates:
-            return ChatResponse(content=content)
+            return ChatResponse(content=content, usage=usage)
 
         parts = response.candidates[0].content.parts
         tc_list: list[dict] = []
@@ -204,4 +244,4 @@ class Gemini(Agent):
         if tc_list:
             tool_calls = tc_list
 
-        return ChatResponse(content=content, tool_calls=tool_calls)
+        return ChatResponse(content=content, tool_calls=tool_calls, usage=usage)

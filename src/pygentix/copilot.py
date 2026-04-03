@@ -1,9 +1,9 @@
 """Azure OpenAI (Microsoft Copilot) LLM backend for agents."""
 
 import os
-from typing import Any
+from typing import Any, Iterator
 
-from .chatgpt import _openai_chat
+from .chatgpt import openai_chat, openai_chat_stream
 from .core import Agent, ChatResponse
 
 __all__ = ["Copilot"]
@@ -13,8 +13,7 @@ class Copilot(Agent):
     """Agent backed by `Azure OpenAI <https://azure.microsoft.com/products/ai-services/openai-service>`_.
 
     Uses the same wire protocol as :class:`~pygentix.chatgpt.ChatGPT` but
-    routes requests through your Azure OpenAI deployment, which is the
-    engine behind Microsoft Copilot.
+    routes requests through your Azure OpenAI deployment.
 
     Parameters
     ----------
@@ -35,28 +34,42 @@ class Copilot(Agent):
         api_key: str | None = None,
         endpoint: str | None = None,
         api_version: str = "2024-10-21",
+        temperature: float = 0,
+        seed: int | None = 42,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.model = model
-        self._api_key = api_key or os.environ.get("AZURE_OPENAI_API_KEY")
-        self._endpoint = endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT")
-        self._api_version = api_version
-        self._client: Any = None
+        self.temperature = temperature
+        self.seed = seed
+        self.api_key = api_key or os.environ.get("AZURE_OPENAI_API_KEY")
+        self.endpoint = endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT")
+        self.api_version = api_version
+        self.client: Any = None
 
-    @property
-    def client(self) -> Any:
-        """Lazy-initialised Azure OpenAI client."""
-        if self._client is None:
+    def ensure_client(self) -> Any:
+        """Return the Azure OpenAI client, creating it on first use."""
+        if self.client is None:
             import openai
 
-            self._client = openai.AzureOpenAI(
-                api_key=self._api_key,
-                azure_endpoint=self._endpoint,
-                api_version=self._api_version,
+            self.client = openai.AzureOpenAI(
+                api_key=self.api_key,
+                azure_endpoint=self.endpoint,
+                api_version=self.api_version,
             )
-        return self._client
+        return self.client
 
     def chat(self, messages: list[dict], **kwargs: Any) -> ChatResponse:
         """Forward *messages* to Azure OpenAI and return a :class:`ChatResponse`."""
-        return _openai_chat(self.client, self.model, self.functions, messages, **kwargs)
+        return openai_chat(
+            self.ensure_client(), self.model, self.functions, messages,
+            temperature=self.temperature, seed=self.seed,
+            retry_fn=self.with_retry, **kwargs,
+        )
+
+    def chat_stream(self, messages: list[dict], **kwargs: Any) -> Iterator[str]:
+        """Yield content chunks via Azure OpenAI's native streaming."""
+        yield from openai_chat_stream(
+            self.ensure_client(), self.model, messages,
+            temperature=self.temperature, seed=self.seed,
+        )

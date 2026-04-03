@@ -1,13 +1,16 @@
 """Ollama LLM backend for agents."""
 
-from typing import Any
+import logging
+from typing import Any, Iterator
 
-from .core import Agent, ChatResponse
+from .core import Agent, ChatResponse, Usage
 
 __all__ = ["Ollama"]
 
+logger = logging.getLogger("pygentix")
 
-def _prepare_ollama_messages(messages: list[dict]) -> list[dict]:
+
+def prepare_ollama_messages(messages: list[dict]) -> list[dict]:
     """Transform internal message format to what the Ollama library expects.
 
     The Ollama Pydantic models require tool calls nested under a ``function``
@@ -34,19 +37,41 @@ def _prepare_ollama_messages(messages: list[dict]) -> list[dict]:
     return result
 
 
+def extract_usage(response: Any) -> Usage:
+    """Pull token counts from an Ollama response object."""
+    prompt = getattr(response, "prompt_eval_count", 0) or 0
+    completion = getattr(response, "eval_count", 0) or 0
+    return Usage(prompt_tokens=prompt, completion_tokens=completion, total_tokens=prompt + completion)
+
+
+DEFAULT_OPTIONS: dict[str, Any] = {"temperature": 0, "top_k": 1, "seed": 42}
+
+
 class Ollama(Agent):
     """Agent backed by a local `Ollama <https://ollama.com>`_ model.
 
-    On construction the model is pulled automatically if it isn't already
-    installed, so the first instantiation may take a while for large models.
+    Parameters
+    ----------
+    model:
+        The model identifier.  Defaults to ``"qwen2.5:7b"``.
+    options:
+        Ollama sampling options.  Merged on top of deterministic defaults
+        (``temperature=0``, ``top_k=1``, ``seed=42``).
     """
 
-    def __init__(self, model: str = "qwen2.5:7b", *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        model: str = "qwen2.5:7b",
+        *args: Any,
+        options: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.model = model
-        self._ensure_model_available()
+        self.options = {**DEFAULT_OPTIONS, **(options or {})}
+        self.ensure_model_available()
 
-    def _ensure_model_available(self) -> None:
+    def ensure_model_available(self) -> None:
         from ollama import list as ollama_list, pull as ollama_pull
 
         response = ollama_list()
@@ -65,12 +90,17 @@ class Ollama(Agent):
         from ollama import chat as ollama_chat
 
         fmt = kwargs.pop("format", None)
-        response = ollama_chat(
-            model=self.model,
-            messages=_prepare_ollama_messages(messages),
-            tools=list(self.functions.values()),
-            **({"format": fmt} if fmt else {}),
-        )
+
+        def do_call() -> Any:
+            return ollama_chat(
+                model=self.model,
+                messages=prepare_ollama_messages(messages),
+                tools=list(self.functions.values()),
+                options=self.options,
+                **({"format": fmt} if fmt else {}),
+            )
+
+        response = self.with_retry(do_call)
 
         tool_calls = None
         if response.message.tool_calls:
@@ -82,4 +112,20 @@ class Ollama(Agent):
         return ChatResponse(
             content=response.message.content or "",
             tool_calls=tool_calls,
+            usage=extract_usage(response),
         )
+
+    def chat_stream(self, messages: list[dict], **kwargs: Any) -> Iterator[str]:
+        """Yield content chunks via Ollama's native streaming."""
+        from ollama import chat as ollama_chat
+
+        stream = ollama_chat(
+            model=self.model,
+            messages=prepare_ollama_messages(messages),
+            options=self.options,
+            stream=True,
+        )
+        for chunk in stream:
+            text = chunk.message.content
+            if text:
+                yield text

@@ -21,7 +21,7 @@ class TestReads:
         assert "run_query" in agent.functions
 
     def test_resolve_populates_descriptions(self, agent):
-        agent._resolve_entities()
+        agent.resolve_entities()
         for cls in (Author, Book):
             desc = agent.entities[cls]
             assert desc["model"] == cls.__name__
@@ -30,8 +30,8 @@ class TestReads:
 
 class TestWrites:
     def test_registers_writable(self, agent):
-        assert "Author" in agent._writable
-        assert "Book" in agent._writable
+        assert "Author" in agent.writable
+        assert "Book" in agent.writable
 
     def test_adds_write_functions(self, agent):
         for name in ("run_insert", "run_update", "run_delete"):
@@ -144,7 +144,7 @@ class TestDescribeModel:
         assert describe_model(Book)["table"] == "books"
 
 
-# -- _coerce_values --------------------------------------------------------
+# -- coerce_values ---------------------------------------------------------
 
 
 class TestCoerceValues:
@@ -155,36 +155,36 @@ class TestCoerceValues:
         return a
 
     def test_string_to_int(self, agent):
-        result = agent._coerce_values(Book, {"author_id": "42"})
+        result = agent.coerce_values(Book, {"author_id": "42"})
         assert result["author_id"] == 42
 
     def test_string_to_float(self, agent):
-        result = agent._coerce_values(Book, {"price": "19.99"})
+        result = agent.coerce_values(Book, {"price": "19.99"})
         assert result["price"] == pytest.approx(19.99)
 
     def test_string_to_date(self, agent_with_events):
-        result = agent_with_events._coerce_values(Event, {"event_date": "2026-04-01"})
+        result = agent_with_events.coerce_values(Event, {"event_date": "2026-04-01"})
         assert result["event_date"] == date(2026, 4, 1)
 
     def test_string_to_datetime(self, agent_with_events):
-        result = agent_with_events._coerce_values(Event, {"created_at": "2026-04-01T10:30:00"})
+        result = agent_with_events.coerce_values(Event, {"created_at": "2026-04-01T10:30:00"})
         assert result["created_at"] == datetime(2026, 4, 1, 10, 30, 0)
 
     def test_string_to_bool_true(self, agent_with_events):
         for val in ("true", "True", "1", "yes"):
-            assert agent_with_events._coerce_values(Event, {"active": val})["active"] is True
+            assert agent_with_events.coerce_values(Event, {"active": val})["active"] is True
 
     def test_string_to_bool_false(self, agent_with_events):
         for val in ("false", "0", "no"):
-            assert agent_with_events._coerce_values(Event, {"active": val})["active"] is False
+            assert agent_with_events.coerce_values(Event, {"active": val})["active"] is False
 
     def test_leaves_non_string_values_unchanged(self, agent):
-        result = agent._coerce_values(Book, {"price": 12.99, "author_id": 1})
+        result = agent.coerce_values(Book, {"price": 12.99, "author_id": 1})
         assert result["price"] == pytest.approx(12.99)
         assert result["author_id"] == 1
 
     def test_leaves_string_columns_unchanged(self, agent):
-        assert agent._coerce_values(Author, {"name": "Tolkien"})["name"] == "Tolkien"
+        assert agent.coerce_values(Author, {"name": "Tolkien"})["name"] == "Tolkien"
 
     def test_end_to_end_insert(self, agent_with_events, engine):
         agent_with_events.run_insert("Event", {
@@ -278,11 +278,11 @@ class TestDeferredResolve:
         assert agent.entities[Author] is None
 
     def test_populated_after_resolve(self, agent):
-        agent._resolve_entities()
+        agent.resolve_entities()
         assert "columns" in agent.entities[Author]
 
     def test_idempotent(self, agent):
-        agent._resolve_entities()
+        agent.resolve_entities()
         first = agent.entities[Author]
-        agent._resolve_entities()
+        agent.resolve_entities()
         assert agent.entities[Author] is first

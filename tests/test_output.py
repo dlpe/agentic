@@ -26,7 +26,7 @@ class TestOutputDict:
     def test_output_cls_is_none_for_dict(self):
         a = StubOutputAgent()
         a.output({"type": "object", "properties": {}})
-        assert a._output_cls is None
+        assert a.output_cls is None
 
 
 # -- output() with a class ------------------------------------------------
@@ -115,7 +115,7 @@ class TestOutputFromClass:
         class Schema:
             name: str
 
-        assert a._output_cls is Schema
+        assert a.output_cls is Schema
 
 
 # -- parse_output ----------------------------------------------------------
@@ -178,15 +178,15 @@ class TestParseOutput:
         assert result.details == "world"
 
 
-# -- _type_to_json edge cases ----------------------------------------------
+# -- type_to_json edge cases -----------------------------------------------
 
 
 class TestTypeToJson:
     def test_unknown_type_falls_back_to_string(self):
-        assert OutputAgent._type_to_json(bytes) == {"type": "string"}
+        assert OutputAgent.type_to_json(bytes) == {"type": "string"}
 
     def test_nested_list(self):
-        result = OutputAgent._type_to_json(list[list[int]])
+        result = OutputAgent.type_to_json(list[list[int]])
         assert result == {"type": "array", "items": {"type": "array", "items": {"type": "integer"}}}
 
 

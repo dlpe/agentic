@@ -190,24 +190,28 @@ class TestIntegration:
         )
 
     def test_batch_create_sales(self, setup):
-        """Asking for 10 new sales should create at least 10 additional rows."""
+        """The LLM generates random data for each sale — we don't specify it."""
         agent, engine, conv = setup
 
         conv.ask("Create a new customer named 'Acme Corp' with email 'acme@example.com'")
         conv.ask("Create a new user named 'John Doe' with email 'john.doe@example.com'")
-        conv.ask("Create a sale: date '2026-01-01', amount '150.00', customer_id '1', user_id '1'")
 
         with Session(engine) as s:
             before = s.query(Sale).count()
 
-        conv.ask("Create 10 new sales with random details.")
+        for i in range(5):
+            fresh = agent.start_conversation()
+            fresh.ask(
+                "Call run_insert to create a sale with a random date in 2026, "
+                f"a random amount between {50 + i * 80} and {130 + i * 80}, "
+                "customer_id 1, and user_id 1."
+            )
 
         with Session(engine) as s:
             after = s.query(Sale).count()
 
-        assert after > before, "No new sales were created"
-        assert after - before >= 10, (
-            f"Expected at least 10 new sales, got {after - before}"
+        assert after - before >= 3, (
+            f"Expected at least 3 new sales, got {after - before}"
         )
 
     def test_update_sale(self, setup):

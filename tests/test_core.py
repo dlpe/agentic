@@ -37,43 +37,43 @@ class TestFunction:
         assert repr(Function(example)) == "Function(example)"
 
 
-# -- Conversation._has_prior_tool_result -----------------------------------
+# -- Conversation.has_prior_tool_result ------------------------------------
 
 
 class TestHasPriorToolResult:
-    def _make_conversation(self):
+    def make_conversation(self):
         mock_agent = MagicMock()
         mock_agent.functions = {"some_tool": lambda: None}
         return Conversation(mock_agent, "system prompt")
 
     def test_false_when_no_messages(self):
-        conv = self._make_conversation()
-        assert conv._has_prior_tool_result() is False
+        conv = self.make_conversation()
+        assert conv.has_prior_tool_result() is False
 
     def test_false_after_user_message(self):
-        conv = self._make_conversation()
+        conv = self.make_conversation()
         conv.messages.append({"role": "user", "content": "hello"})
-        assert conv._has_prior_tool_result() is False
+        assert conv.has_prior_tool_result() is False
 
     def test_true_after_tool_result(self):
-        conv = self._make_conversation()
+        conv = self.make_conversation()
         conv.messages.append({"role": "user", "content": "hello"})
         conv.messages.append({"role": "tool", "content": "result"})
-        assert conv._has_prior_tool_result() is True
+        assert conv.has_prior_tool_result() is True
 
     def test_false_after_new_user_message_following_tool(self):
-        conv = self._make_conversation()
+        conv = self.make_conversation()
         conv.messages.append({"role": "user", "content": "first"})
         conv.messages.append({"role": "tool", "content": "result"})
         conv.messages.append({"role": "user", "content": "second"})
-        assert conv._has_prior_tool_result() is False
+        assert conv.has_prior_tool_result() is False
 
 
 # -- Conversation retry logic ----------------------------------------------
 
 
 class TestConversationRetry:
-    def _make_mock_response(self, content="", tool_calls=None):
+    def make_mock_response(self, content="", tool_calls=None):
         resp = MagicMock()
         resp.message.content = content
         resp.message.tool_calls = tool_calls
@@ -87,8 +87,8 @@ class TestConversationRetry:
         tool_call.function.arguments = {}
 
         mock_agent.chat.side_effect = [
-            self._make_mock_response(tool_calls=[tool_call]),
-            self._make_mock_response(content="done"),
+            self.make_mock_response(tool_calls=[tool_call]),
+            self.make_mock_response(content="done"),
         ]
         mock_agent.functions = {"tool": lambda: "ok"}
 
@@ -100,7 +100,7 @@ class TestConversationRetry:
         mock_agent = MagicMock()
         mock_agent.output_schema = None
         mock_agent.functions = {}
-        mock_agent.chat.return_value = self._make_mock_response(content="answer")
+        mock_agent.chat.return_value = self.make_mock_response(content="answer")
 
         conv = Conversation(mock_agent, "system")
         resp = conv.ask("question")
@@ -115,9 +115,9 @@ class TestConversationRetry:
         tool_call.function.arguments = {}
 
         mock_agent.chat.side_effect = [
-            self._make_mock_response(content="I will..."),
-            self._make_mock_response(tool_calls=[tool_call]),
-            self._make_mock_response(content="done"),
+            self.make_mock_response(content="I will..."),
+            self.make_mock_response(tool_calls=[tool_call]),
+            self.make_mock_response(content="done"),
         ]
         mock_agent.functions = {"tool": lambda: "ok"}
 
@@ -134,9 +134,9 @@ class TestConversationRetry:
         tool_call.function.arguments = {}
 
         mock_agent.chat.side_effect = [
-            self._make_mock_response(content="Let me think..."),
-            self._make_mock_response(tool_calls=[tool_call]),
-            self._make_mock_response(content="done"),
+            self.make_mock_response(content="Let me think..."),
+            self.make_mock_response(tool_calls=[tool_call]),
+            self.make_mock_response(content="done"),
         ]
         mock_agent.functions = {"tool": lambda: "ok"}
 
@@ -153,7 +153,7 @@ class TestConversationRetry:
         mock_agent = MagicMock()
         mock_agent.output_schema = None
         mock_agent.functions = {}
-        mock_agent.chat.return_value = self._make_mock_response(content="the answer")
+        mock_agent.chat.return_value = self.make_mock_response(content="the answer")
 
         conv = Conversation(mock_agent, "system")
         conv.ask("question")

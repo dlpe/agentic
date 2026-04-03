@@ -39,6 +39,31 @@ class Event(Base):
     score = Column(Float)
 
 
+class Tenant(Base):
+    __tablename__ = "tenants"
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    owner_id = Column(Integer)
+    projects = relationship("Project", back_populates="tenant")
+
+
+class Project(Base):
+    __tablename__ = "projects"
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"))
+    tenant = relationship("Tenant", back_populates="projects")
+    tasks = relationship("Task", back_populates="project")
+
+
+class Task(Base):
+    __tablename__ = "tasks"
+    id = Column(Integer, primary_key=True)
+    title = Column(String)
+    project_id = Column(Integer, ForeignKey("projects.id"))
+    project = relationship("Project", back_populates="tasks")
+
+
 # -- stubs -----------------------------------------------------------------
 
 

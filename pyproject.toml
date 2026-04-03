@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pygentix"
-version = "0.1.0"
+version = "0.1.1"
 description = "Composable AI agent framework — drop-in LLM tool-calling, structured output, and SQLAlchemy integration for any Python project."
 authors = [
     { name = "Andre Perussi", email = "dlperussi@hotmail.com" },
@@ -31,15 +31,19 @@ dependencies = [
 ollama = ["ollama>=0.4"]
 openai = ["openai>=1.0"]
 gemini = ["google-genai>=1.0"]
+scheduler = ["croniter>=1.0"]
 all = [
     "ollama>=0.4",
     "openai>=1.0",
     "google-genai>=1.0",
+    "croniter>=1.0",
 ]
 dev = [
     "ollama>=0.4",
     "openai>=1.0",
     "google-genai>=1.0",
+    "croniter>=1.0",
+    "pymupdf>=1.24",
     "pytest>=8.0",
 ]
 
