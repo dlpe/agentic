@@ -10,14 +10,26 @@ from functools import wraps
 import inspect
 from typing import Any, Callable, Iterator
 
-__all__ = ["Function", "ChatResponse", "Usage", "Conversation", "Agent", "active_scope", "active_conversation"]
+__all__ = [
+    "Function",
+    "ChatResponse",
+    "Usage",
+    "Conversation",
+    "Agent",
+    "active_scope",
+    "active_conversation",
+]
 
 active_scope: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
-    "pygentix_scope", default=None,
+    "pygentix_scope",
+    default=None,
 )
 
-active_conversation: contextvars.ContextVar["Conversation | None"] = contextvars.ContextVar(
-    "pygentix_conversation", default=None,
+active_conversation: contextvars.ContextVar["Conversation | None"] = (
+    contextvars.ContextVar(
+        "pygentix_conversation",
+        default=None,
+    )
 )
 
 logger = logging.getLogger("pygentix")
@@ -29,13 +41,26 @@ DEFAULT_SYSTEM_PROMPT = (
     "If you can provide the answer directly, do so. "
     "If your answer doesn't call a tool, it must be the final answer. "
     "No follow-up questions are allowed."
+    "You are not allowed to respond with SQL queries. You are only allowed to respond with the result of the SQL query."
+    "You are allowed to call tools again if you still don't have a satisfatory final answer that covers all the requirements asked."
+    "You are not allowed to respond with any other text than the satisfactory final answer."
+    "If your response does not contain any tool calls, it MUST be the final answer."
+    "If your response does not contain a satisfactroy final answer, you MUST call a tool again."
+    "You are not allowed to respond with SQL queries or instructions to the user in the content. You should NEVER tell them what to do."
+    "Unless the user specifically asks for a SQL query, you should NOT give them a SQL query as final response. You must call a tool instead."
+    "If your response is not satisfactory for the user's requirements but you cannot figure out how to get a satisfactory final answer, you MUST respond with 'I cannot answer this question.' and end the conversation."
+    "The content of your response should be the final answer or empty if you cannot answer the question. In such case you must include tool calls to fulfill the request."
 )
 
 TOOL_NUDGE = "Don't describe what you will do. Call the appropriate tool now."
 
 PYTHON_TO_JSON_TYPE: dict[type, str] = {
-    str: "string", int: "integer", float: "number",
-    bool: "boolean", list: "array", dict: "object",
+    str: "string",
+    int: "integer",
+    float: "number",
+    bool: "boolean",
+    list: "array",
+    dict: "object",
 }
 
 RETRIABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
@@ -49,6 +74,7 @@ class Usage:
 
     Populated automatically by backends that report token counts.
     """
+
     __slots__ = ("prompt_tokens", "completion_tokens", "total_tokens")
 
     def __init__(
@@ -74,6 +100,7 @@ class Usage:
 
 class FunctionCall:
     """Name + arguments of a single function invocation."""
+
     __slots__ = ("name", "arguments")
 
     def __init__(self, name: str, arguments: dict) -> None:
@@ -83,6 +110,7 @@ class FunctionCall:
 
 class ToolCall:
     """A tool call requested by the model, optionally carrying a provider ID."""
+
     __slots__ = ("id", "function")
 
     def __init__(self, name: str, arguments: dict, id: str | None = None) -> None:
@@ -111,6 +139,7 @@ class ChatResponse:
         call.id                         # str | None  (provider-specific)
         response.usage                  # Usage (token counts)
     """
+
     __slots__ = ("message", "usage")
 
     def __init__(
@@ -122,8 +151,7 @@ class ChatResponse:
         parsed = None
         if tool_calls:
             parsed = [
-                ToolCall(tc["name"], tc["arguments"], tc.get("id"))
-                for tc in tool_calls
+                ToolCall(tc["name"], tc["arguments"], tc.get("id")) for tc in tool_calls
             ]
         self.message = Message(content, parsed)
         self.usage = usage or Usage()
@@ -177,11 +205,17 @@ class Function:
             if param_name == "self":
                 continue
             annotation = param.annotation
+            if annotation is inspect.Parameter.empty:
+                annotation = str
+            origin = getattr(annotation, "__origin__", None)
             json_type = PYTHON_TO_JSON_TYPE.get(
-                annotation if annotation is not inspect.Parameter.empty else str,
+                origin or annotation,
                 "string",
             )
-            properties[param_name] = {"type": json_type}
+            prop: dict[str, Any] = {"type": json_type}
+            if json_type == "array":
+                prop["items"] = {"type": "object"}
+            properties[param_name] = prop
             if param.default is inspect.Parameter.empty:
                 required.append(param_name)
 
@@ -348,7 +382,9 @@ class Conversation:
                 yield from self.stream_final()
                 return
             response = self.apply_output_schema(response)
-            self.messages.append({"role": "assistant", "content": response.message.content})
+            self.messages.append(
+                {"role": "assistant", "content": response.message.content}
+            )
             yield response.message.content
             return
 
@@ -397,9 +433,12 @@ class Conversation:
                 attempt < max_retries - 1
                 and self.agent.functions
                 and not self.has_prior_tool_result()
+                and not response.message.content.strip()
             )
             if should_retry:
-                self.messages.append({"role": "assistant", "content": response.message.content})
+                self.messages.append(
+                    {"role": "assistant", "content": response.message.content}
+                )
                 self.messages.append({"role": "user", "content": TOOL_NUDGE})
             else:
                 return response
@@ -433,14 +472,20 @@ class Conversation:
     def execute_tool_calls(self, response: ChatResponse) -> ChatResponse:
         """Execute tool calls in a loop until the model stops requesting them."""
         while response.message.tool_calls:
-            self.messages.append({
-                "role": "assistant",
-                "content": response.message.content,
-                "tool_calls": [
-                    {"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments}
-                    for tc in response.message.tool_calls
-                ],
-            })
+            self.messages.append(
+                {
+                    "role": "assistant",
+                    "content": response.message.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        }
+                        for tc in response.message.tool_calls
+                    ],
+                }
+            )
 
             for call in response.message.tool_calls:
                 name = call.function.name
@@ -459,12 +504,14 @@ class Conversation:
 
                 self.agent.fire("tool_result", name, result)
                 logger.debug("Tool %s → %s", name, result[:200])
-                self.messages.append({
-                    "role": "tool",
-                    "tool_name": name,
-                    "tool_call_id": call.id,
-                    "content": result,
-                })
+                self.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_name": name,
+                        "tool_call_id": call.id,
+                        "content": result,
+                    }
+                )
 
             response = self.agent.chat(messages=self.messages)
             self.agent.fire("response", response)
@@ -483,7 +530,9 @@ class Conversation:
         schema = getattr(self.agent, "output_schema", None)
         if schema:
             response = self.agent.chat(messages=self.messages, format=schema)
-            self.messages.append({"role": "assistant", "content": response.message.content})
+            self.messages.append(
+                {"role": "assistant", "content": response.message.content}
+            )
             yield response.message.content
         else:
             parts: list[str] = []
@@ -517,9 +566,12 @@ class Conversation:
                 attempt < max_retries - 1
                 and self.agent.functions
                 and not self.has_prior_tool_result()
+                and not response.message.content.strip()
             )
             if should_retry:
-                self.messages.append({"role": "assistant", "content": response.message.content})
+                self.messages.append(
+                    {"role": "assistant", "content": response.message.content}
+                )
                 self.messages.append({"role": "user", "content": TOOL_NUDGE})
             else:
                 return response
@@ -528,14 +580,20 @@ class Conversation:
 
     async def execute_tool_calls_async(self, response: ChatResponse) -> ChatResponse:
         while response.message.tool_calls:
-            self.messages.append({
-                "role": "assistant",
-                "content": response.message.content,
-                "tool_calls": [
-                    {"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments}
-                    for tc in response.message.tool_calls
-                ],
-            })
+            self.messages.append(
+                {
+                    "role": "assistant",
+                    "content": response.message.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        }
+                        for tc in response.message.tool_calls
+                    ],
+                }
+            )
 
             for call in response.message.tool_calls:
                 name = call.function.name
@@ -556,12 +614,14 @@ class Conversation:
 
                 self.agent.fire("tool_result", name, result)
                 logger.debug("Tool %s → %s", name, result[:200])
-                self.messages.append({
-                    "role": "tool",
-                    "tool_name": name,
-                    "tool_call_id": call.id,
-                    "content": result,
-                })
+                self.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_name": name,
+                        "tool_call_id": call.id,
+                        "content": result,
+                    }
+                )
 
             response = await self.agent.chat_async(messages=self.messages)
             self.agent.fire("response", response)
@@ -595,6 +655,9 @@ class Agent(ABC):
         Initial delay in seconds between retries (doubles each attempt).
     """
 
+    system_prompt: str | None = None
+    temperature: float = 0
+
     def __init__(
         self,
         *args: Any,
@@ -602,7 +665,7 @@ class Agent(ABC):
         retry_delay: float = 1.0,
         **kwargs: Any,
     ) -> None:
-        super().__init__(*args, **kwargs)
+        super().__init__()
         self.functions: dict[str, Function] = {}
         self.conversations: list[Conversation] = []
         self.max_retries = max_retries
@@ -663,10 +726,13 @@ class Agent(ABC):
                 last_exc = exc
                 if attempt == self.max_retries - 1 or not self.is_retriable(exc):
                     raise
-                delay = self.retry_delay * (2 ** attempt)
+                delay = self.retry_delay * (2**attempt)
                 logger.warning(
                     "Transient error (attempt %d/%d): %s — retrying in %.1fs",
-                    attempt + 1, self.max_retries, exc, delay,
+                    attempt + 1,
+                    self.max_retries,
+                    exc,
+                    delay,
                 )
                 time.sleep(delay)
         raise last_exc  # pragma: no cover
@@ -681,10 +747,13 @@ class Agent(ABC):
                 last_exc = exc
                 if attempt == self.max_retries - 1 or not self.is_retriable(exc):
                     raise
-                delay = self.retry_delay * (2 ** attempt)
+                delay = self.retry_delay * (2**attempt)
                 logger.warning(
                     "Transient error (attempt %d/%d): %s — retrying in %.1fs",
-                    attempt + 1, self.max_retries, exc, delay,
+                    attempt + 1,
+                    self.max_retries,
+                    exc,
+                    delay,
                 )
                 await asyncio.sleep(delay)
         raise last_exc  # pragma: no cover
@@ -731,15 +800,22 @@ class Agent(ABC):
 
     def start_conversation(
         self,
-        system: str = DEFAULT_SYSTEM_PROMPT,
+        prompt: str | None = None,
         max_history: int | None = None,
         scope: dict | None = None,
         policy: Callable[..., bool] | None = None,
     ) -> Conversation:
-        """Begin a new conversation with the given system prompt.
+        """Begin a new conversation.
+
+        The system prompt is always ``DEFAULT_SYSTEM_PROMPT`` and cannot
+        be overridden.  An optional *prompt* is injected as the first
+        user message to give the conversation extra context.
 
         Parameters
         ----------
+        prompt:
+            Optional text added as the first user message (not the
+            system prompt).
         scope:
             Identity context forwarded to row-level security filters
             and the *policy* callback (e.g. ``{"current_user": 5}``).
@@ -748,7 +824,13 @@ class Agent(ABC):
             evaluated before every tool execution.
         """
         conv = Conversation(
-            self, system, max_history=max_history, scope=scope, policy=policy,
+            self,
+            DEFAULT_SYSTEM_PROMPT,
+            max_history=max_history,
+            scope=scope,
+            policy=policy,
         )
+        if prompt:
+            conv.messages.append({"role": "user", "content": prompt})
         self.conversations.append(conv)
         return conv

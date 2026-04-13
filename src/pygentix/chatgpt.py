@@ -34,33 +34,40 @@ def prepare_openai_messages(messages: list[dict]) -> list[dict]:
             content_parts: list[dict] = [{"type": "text", "text": msg["content"]}]
             for img_path in msg["images"]:
                 b64, mime = encode_image(img_path)
-                content_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{mime};base64,{b64}"},
-                })
+                content_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    }
+                )
             result.append({"role": "user", "content": content_parts})
         elif role == "assistant" and msg.get("tool_calls"):
-            result.append({
-                "role": "assistant",
-                "content": msg.get("content") or "",
-                "tool_calls": [
-                    {
-                        "id": tc.get("id") or f"call_{tc['name']}",
-                        "type": "function",
-                        "function": {
-                            "name": tc["name"],
-                            "arguments": json.dumps(tc["arguments"]),
-                        },
-                    }
-                    for tc in msg["tool_calls"]
-                ],
-            })
+            result.append(
+                {
+                    "role": "assistant",
+                    "content": msg.get("content") or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.get("id") or f"call_{tc['name']}",
+                            "type": "function",
+                            "function": {
+                                "name": tc["name"],
+                                "arguments": json.dumps(tc["arguments"]),
+                            },
+                        }
+                        for tc in msg["tool_calls"]
+                    ],
+                }
+            )
         elif role == "tool":
-            result.append({
-                "role": "tool",
-                "tool_call_id": msg.get("tool_call_id") or f"call_{msg.get('tool_name', '')}",
-                "content": msg["content"],
-            })
+            result.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": msg.get("tool_call_id")
+                    or f"call_{msg.get('tool_name', '')}",
+                    "content": msg["content"],
+                }
+            )
         else:
             result.append({"role": role, "content": msg.get("content", "")})
 
@@ -91,7 +98,9 @@ def parse_openai_response(choice: Any, usage: Usage | None = None) -> ChatRespon
             }
             for tc in choice.message.tool_calls
         ]
-    return ChatResponse(content=choice.message.content or "", tool_calls=tool_calls, usage=usage)
+    return ChatResponse(
+        content=choice.message.content or "", tool_calls=tool_calls, usage=usage
+    )
 
 
 def openai_chat(
@@ -176,13 +185,11 @@ class ChatGPT(Agent):
         model: str = "gpt-4o-mini",
         *,
         api_key: str | None = None,
-        temperature: float = 0,
         seed: int | None = 42,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.model = model
-        self.temperature = temperature
         self.seed = seed
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self.client: Any = None
@@ -198,14 +205,22 @@ class ChatGPT(Agent):
     def chat(self, messages: list[dict], **kwargs: Any) -> ChatResponse:
         """Forward *messages* to the OpenAI API and return a :class:`ChatResponse`."""
         return openai_chat(
-            self.ensure_client(), self.model, self.functions, messages,
-            temperature=self.temperature, seed=self.seed,
-            retry_fn=self.with_retry, **kwargs,
+            self.ensure_client(),
+            self.model,
+            self.functions,
+            messages,
+            temperature=self.temperature,
+            seed=self.seed,
+            retry_fn=self.with_retry,
+            **kwargs,
         )
 
     def chat_stream(self, messages: list[dict], **kwargs: Any) -> Iterator[str]:
         """Yield content chunks via OpenAI's native streaming."""
         yield from openai_chat_stream(
-            self.ensure_client(), self.model, messages,
-            temperature=self.temperature, seed=self.seed,
+            self.ensure_client(),
+            self.model,
+            messages,
+            temperature=self.temperature,
+            seed=self.seed,
         )

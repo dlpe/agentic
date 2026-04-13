@@ -4,7 +4,7 @@ import logging
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import inspect as sa_inspect, select, types as sa_types
+from sqlalchemy import func, inspect as sa_inspect, select, types as sa_types
 from sqlalchemy.orm import Session
 
 from .core import Agent, Function, active_scope
@@ -15,16 +15,24 @@ logger = logging.getLogger("pygentix")
 
 QUERY_REFERENCE = """\
 Supported query operators: eq, gt, lt, gte, lte, like, ilike, in, not_in, is_null, is_not_null
-Supported joins: left, right, inner, outer
+Supported joins: left, right, inner, outer (value is the relationship attribute name on the root entity, e.g. "author")
+Supported aggregations: count, sum, avg, min, max, group_by
 Supported modifiers: asc, desc, limit, offset
 
+Aggregate queries: put filters and joins first, then group_by, then other aggregates, then asc/desc/limit/offset.
+(Modifiers after aggregates apply to the aggregate result; modifiers before aggregates apply to the inner rows.)
+
 Examples:
-  run_query([{{"entity": "Author", "field": "name", "op": "eq", "value": "Tolkien"}}])
-  run_query([{{"entity": "Author"}}, {{"field": "name", "op": "like", "value": "%Tolk%"}}])
-  run_insert("Author", {{"name": "Tolkien"}})
-  run_insert("Author", [{{"name": "A"}}, {{"name": "B"}}])  # batch insert
-  run_update("Author", {{"name": "Tolkien"}}, {{"name": "J.R.R. Tolkien"}})
-  run_delete("Author", {{"name": "Tolkien"}})
+  run_query([{"entity": "Author", "field": "name", "op": "eq", "value": "Tolkien"}])
+  run_query([{"entity": "Author"}, {"field": "name", "op": "like", "value": "%Tolk%"}])
+  run_query([{"entity": "Book", "op": "count"}])
+  run_query([{"entity": "Book", "field": "price", "op": "sum"}])
+  run_query([{"entity": "Book"}, {"field": "author_id", "op": "group_by"}, {"field": "price", "op": "avg"}])
+  run_query([{"entity": "Book"}, {"op": "inner", "value": "author"}, {"entity": "Author", "field": "name", "op": "group_by"}, {"field": "price", "op": "sum"}])
+  run_insert("Author", {"name": "Tolkien"})
+  run_insert("Author", [{"name": "A"}, {"name": "B"}])
+  run_update("Author", {"name": "Tolkien"}, {"name": "J.R.R. Tolkien"})
+  run_delete("Author", {"name": "Tolkien"})
 """
 
 
@@ -51,6 +59,11 @@ class SqlAlchemyAgent(Agent):
         "is_null": lambda col: col.is_(None),
         "is_not_null": lambda col: col.is_not(None),
     }
+
+    AGGREGATE_OPS: frozenset[str] = frozenset(
+        {"count", "sum", "avg", "min", "max", "group_by"},
+    )
+    OUTER_AFTER_AGG_OPS: frozenset[str] = frozenset({"asc", "desc", "limit", "offset"})
 
     def __init__(self, engine: Any, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -142,7 +155,10 @@ class SqlAlchemyAgent(Agent):
         return filters
 
     def apply_scope_to_query(
-        self, query: Any, entity_cls: type, entity_name: str,
+        self,
+        query: Any,
+        entity_cls: type,
+        entity_name: str,
     ) -> Any:
         """Apply direct scope (A) or scope chain (B) filters to a SELECT."""
         direct = self.resolve_scope_filters(entity_name)
@@ -157,7 +173,10 @@ class SqlAlchemyAgent(Agent):
         return query
 
     def apply_chain_to_query(
-        self, query: Any, root_cls: type, chain: list[tuple],
+        self,
+        query: Any,
+        root_cls: type,
+        chain: list[tuple],
     ) -> Any:
         """Walk a scope_chain and add JOINs + a final WHERE to *query*."""
         scope = self.get_scope()
@@ -178,7 +197,8 @@ class SqlAlchemyAgent(Agent):
                 pk_col = sa_inspect(target_cls).primary_key[0]
                 query = query.join(
                     target_cls,
-                    getattr(current_cls, fk_col_name) == getattr(target_cls, pk_col.key),
+                    getattr(current_cls, fk_col_name)
+                    == getattr(target_cls, pk_col.key),
                 )
                 current_cls = target_cls
         return query
@@ -271,7 +291,10 @@ class SqlAlchemyAgent(Agent):
         return filters
 
     def validate_chain_mutation(
-        self, entity_name: str, cls: type, filters: dict,
+        self,
+        entity_name: str,
+        cls: type,
+        filters: dict,
     ) -> None:
         """For scope_chain entities, verify that matched rows belong to scope."""
         chain = self.entity_scope_chain.get(entity_name)
@@ -291,23 +314,100 @@ class SqlAlchemyAgent(Agent):
 
     # -- CRUD tools --------------------------------------------------------
 
+    def aggregate_step_bounds(self, steps: list[dict]) -> tuple[int | None, int | None]:
+        first: int | None = None
+        last: int | None = None
+        for i, s in enumerate(steps):
+            if s["op"] in self.AGGREGATE_OPS:
+                if first is None:
+                    first = i
+                last = i
+        return first, last
+
+    def run_query_select_for_steps(
+        self,
+        entity_name: str,
+        entity_cls: type,
+        steps: list[dict],
+        has_agg: bool,
+    ) -> Any:
+        """Initial ``select`` for *entity_cls*, optionally including joined ORM types."""
+        extra_names = {
+            s["entity"] for s in steps if s.get("entity") and s["entity"] != entity_name
+        }
+        extras = [
+            self.entities_by_name[n] for n in extra_names if n in self.entities_by_name
+        ]
+        if has_agg and extras:
+            return select(entity_cls, *extras)
+        return select(entity_cls)
+
     def run_query(self, query_steps: list[dict]) -> list[dict]:
         """Query an entity using a list of filter/modifier steps."""
         entity_name = query_steps[0]["entity"]
         entity_cls = self.entities_by_name[entity_name]
-        query = select(entity_cls)
+        steps = [s for s in query_steps if s.get("op")]
+        first_agg, last_agg = self.aggregate_step_bounds(steps)
 
+        query = self.run_query_select_for_steps(
+            entity_name,
+            entity_cls,
+            steps,
+            first_agg is not None,
+        )
         query = self.apply_scope_to_query(query, entity_cls, entity_name)
 
-        for step in query_steps:
-            if not step.get("op"):
-                continue
-            query = self.apply_step(query, step.get("field"), step["op"], step.get("value"))
+        if first_agg is None:
+            for s in steps:
+                query = self.apply_step(query, s.get("field"), s["op"], s.get("value"))
+            with Session(self.engine) as session:
+                rows = session.execute(query).fetchall()
+                return [self.row_to_dict(row, entity_cls) for row in rows]
 
-        columns = sa_inspect(entity_cls).columns
+        return self.run_query_with_aggregates(
+            query,
+            entity_cls,
+            steps,
+            first_agg,
+            last_agg,
+        )
+
+    def run_query_with_aggregates(
+        self,
+        query: Any,
+        entity_cls: type,
+        steps: list[dict],
+        first_agg: int,
+        last_agg: int,
+    ) -> list[dict]:
+        inner_steps = steps[:first_agg]
+        agg_steps = steps[first_agg : last_agg + 1]
+        outer_steps = steps[last_agg + 1 :]
+
+        for s in outer_steps:
+            if s["op"] not in self.OUTER_AFTER_AGG_OPS:
+                raise ValueError(
+                    f"After aggregate steps only asc, desc, limit, offset are allowed, not {s['op']!r}",
+                )
+
+        for s in inner_steps:
+            query = self.apply_step(query, s.get("field"), s["op"], s.get("value"))
+
+        subq = query.subquery()
+        outer, sortable = self.build_aggregate_select(subq, agg_steps)
+
+        for s in outer_steps:
+            outer = self.apply_outer_step(
+                outer,
+                s.get("field"),
+                s["op"],
+                s.get("value"),
+                sortable,
+            )
+
         with Session(self.engine) as session:
-            rows = session.execute(query).fetchall()
-            return [self.row_to_dict(row, entity_cls, columns) for row in rows]
+            rows = session.execute(outer).fetchall()
+            return [self.row_to_dict(row, entity_cls) for row in rows]
 
     def run_insert(self, entity: str, values: dict | list[dict]) -> str:
         """Insert one or many rows.  Accepts a dict or a list of dicts."""
@@ -359,10 +459,9 @@ class SqlAlchemyAgent(Agent):
     # -- conversation setup ------------------------------------------------
 
     def start_conversation(self, **kwargs: Any):
-        """Build a system prompt with entity descriptions and query reference.
+        """Start a conversation with entity descriptions appended to the system prompt.
 
-        Accepts the same *scope* and *policy* keyword arguments as
-        :meth:`Agent.start_conversation`.
+        Accepts the same keyword arguments as :meth:`Agent.start_conversation`.
         """
         self.resolve_entities()
 
@@ -375,15 +474,158 @@ class SqlAlchemyAgent(Agent):
                 line += f"  relationships: [{rels}]"
             entity_lines.append(line)
 
-        base = kwargs.pop("system", "")
-        system = (
-            f"{base}\n"
-            f"Database entities:\n" + "\n".join(entity_lines) + "\n\n"
-            f"{QUERY_REFERENCE}"
+        conv = super().start_conversation(**kwargs)
+        db_context = (
+            "Database entities:\n" + "\n".join(entity_lines) + "\n\n" + QUERY_REFERENCE
         )
-        return super().start_conversation(system=system, **kwargs)
+        conv.messages[0]["content"] += "\n" + db_context
+        return conv
 
     # -- internals ---------------------------------------------------------
+
+    def resolve_subq_column(
+        self,
+        subq: Any,
+        field: str,
+        step_entity: str | None,
+    ) -> Any:
+        """Resolve *field* on *subq*; *step_entity* helps disambiguate joined tables."""
+        try:
+            return subq.c[field]
+        except KeyError:
+            pass
+        if step_entity:
+            model = self.entities_by_name.get(step_entity)
+            if model is not None:
+                tab = model.__tablename__
+                prefixed = f"{tab}_{field}"
+                if prefixed in subq.c:
+                    return subq.c[prefixed]
+        raise ValueError(
+            f"Column {field!r} not found in subquery (entity={step_entity!r}); "
+            f"available: {list(subq.c.keys())}",
+        )
+
+    def aggregate_append_group_by(
+        self,
+        subq: Any,
+        step: dict,
+        select_parts: list[Any],
+        group_by_cols: list[Any],
+        sortable: dict[str, Any],
+        seen_non_group_agg: bool,
+    ) -> bool:
+        """Append a ``group_by`` step; returns new *seen_non_group_agg* (always False)."""
+        field = step.get("field")
+        if not field:
+            raise ValueError("group_by requires field")
+        if seen_non_group_agg:
+            raise ValueError(
+                "group_by steps must appear before count/sum/avg/min/max",
+            )
+        col = self.resolve_subq_column(subq, field, step.get("entity"))
+        group_by_cols.append(col)
+        labeled = col.label(field)
+        select_parts.append(labeled)
+        sortable[field] = labeled
+        return False
+
+    def aggregate_append_function(
+        self,
+        subq: Any,
+        step: dict,
+        select_parts: list[Any],
+        sortable: dict[str, Any],
+    ) -> None:
+        """Append count / sum / avg / min / max to the aggregate SELECT."""
+        op = step["op"]
+        field = step.get("field")
+        ent = step.get("entity")
+        if op == "count":
+            if field:
+                col = self.resolve_subq_column(subq, field, ent)
+                lbl = f"count_{field}"
+                expr = func.count(col).label(lbl)
+            else:
+                lbl = "count"
+                expr = func.count().label(lbl)
+            select_parts.append(expr)
+            sortable[lbl] = expr
+            return
+        if op in ("sum", "avg", "min", "max"):
+            if not field:
+                raise ValueError(f"{op} requires field")
+            col = self.resolve_subq_column(subq, field, ent)
+            lbl = f"{op}_{field}"
+            labeled = getattr(func, op)(col).label(lbl)
+            select_parts.append(labeled)
+            sortable[lbl] = labeled
+            return
+        raise ValueError(f"Unknown aggregate op: {op}")
+
+    def build_aggregate_select(
+        self,
+        subq: Any,
+        agg_steps: list[dict],
+    ) -> tuple[Any, dict[str, Any]]:
+        """Build ``SELECT … FROM subq`` for aggregate *agg_steps*.
+
+        Returns the statement and a map of result column names to SQL elements
+        for ``asc`` / ``desc`` on the outer query.
+        """
+        select_parts: list[Any] = []
+        group_by_cols: list[Any] = []
+        sortable: dict[str, Any] = {}
+        seen_non_group_agg = False
+
+        for step in agg_steps:
+            if step["op"] == "group_by":
+                seen_non_group_agg = self.aggregate_append_group_by(
+                    subq,
+                    step,
+                    select_parts,
+                    group_by_cols,
+                    sortable,
+                    seen_non_group_agg,
+                )
+            else:
+                seen_non_group_agg = True
+                self.aggregate_append_function(subq, step, select_parts, sortable)
+
+        if not select_parts:
+            raise ValueError("No aggregate select expressions produced")
+
+        stmt = select(*select_parts).select_from(subq)
+        if group_by_cols:
+            stmt = stmt.group_by(*group_by_cols)
+
+        return stmt, sortable
+
+    def apply_outer_step(
+        self,
+        query: Any,
+        field: str | None,
+        op: str,
+        value: Any,
+        sortable: dict[str, Any],
+    ) -> Any:
+        """Apply asc/desc/limit/offset to an aggregate (outer) SELECT."""
+        if op == "limit":
+            return query.limit(value)
+        if op == "offset":
+            return query.offset(value)
+        if op in ("asc", "desc"):
+            if not field:
+                raise ValueError(
+                    f"{op} requires field (aggregate result column name, e.g. avg_price, count)",
+                )
+            if field not in sortable:
+                raise ValueError(
+                    f"Unknown sort column {field!r}; known: {sorted(sortable)}",
+                )
+            col = sortable[field]
+            return query.order_by(col.desc() if op == "desc" else col.asc())
+        raise ValueError(f"Unexpected outer step: {op}")
 
     def apply_step(self, query: Any, field: str | None, op: str, value: Any) -> Any:
         """Apply a single filter / modifier step to a SQLAlchemy query."""
@@ -407,7 +649,7 @@ class SqlAlchemyAgent(Agent):
         raise ValueError(f"Unsupported operator: {op}")
 
     @staticmethod
-    def row_to_dict(row: Any, entity_cls: type, columns: Any) -> dict:
+    def row_to_dict(row: Any, entity_cls: type) -> dict:
         """Convert a SQLAlchemy result row to a plain dict."""
         mapping = row._mapping
         entity_name = entity_cls.__name__
@@ -415,11 +657,11 @@ class SqlAlchemyAgent(Agent):
         if entity_name in mapping and hasattr(mapping[entity_name], "__table__"):
             obj = mapping[entity_name]
             result = {}
-            for col in columns:
-                val = getattr(obj, col.key)
+            for prop in sa_inspect(entity_cls).column_attrs:
+                val = getattr(obj, prop.key)
                 if isinstance(val, (date, datetime)):
                     val = val.isoformat()
-                result[col.key] = val
+                result[prop.key] = val
             return result
 
         return dict(mapping)
@@ -427,14 +669,18 @@ class SqlAlchemyAgent(Agent):
     def coerce_values(self, cls: type, values: dict) -> dict:
         """Cast string values to the types expected by the model's columns."""
         mapper = sa_inspect(cls)
-        col_map = {c.key: c for c in mapper.columns}
+        col_map = {p.key: p.columns[0] for p in mapper.column_attrs}
         coerced = {}
 
         for key, val in values.items():
             col = col_map.get(key)
             if col is not None and isinstance(val, str):
                 col_type = type(col.type)
-                if col_type in (sa_types.Integer, sa_types.BigInteger, sa_types.SmallInteger):
+                if col_type in (
+                    sa_types.Integer,
+                    sa_types.BigInteger,
+                    sa_types.SmallInteger,
+                ):
                     val = int(val)
                 elif col_type in (sa_types.Float, sa_types.Numeric):
                     val = float(val)
@@ -463,19 +709,21 @@ def describe_model(model_cls: type) -> dict:
     """
     mapper = sa_inspect(model_cls)
 
-    columns = [
-        {
-            "name": col.key,
-            "type": str(col.type),
-            "nullable": col.nullable,
-            "primary_key": col.primary_key,
-            "foreign_keys": [
-                {"target": fk.target_fullname, "column": str(fk.column)}
-                for fk in col.foreign_keys
-            ],
-        }
-        for col in mapper.columns
-    ]
+    columns = []
+    for prop in mapper.column_attrs:
+        col = prop.columns[0]
+        columns.append(
+            {
+                "name": prop.key,
+                "type": str(col.type),
+                "nullable": col.nullable,
+                "primary_key": col.primary_key,
+                "foreign_keys": [
+                    {"target": fk.target_fullname, "column": str(fk.column)}
+                    for fk in col.foreign_keys
+                ],
+            }
+        )
 
     relationships = [
         {

@@ -270,6 +270,95 @@ class TestRunQuery:
         assert len(agent.run_query([{"entity": "Author", "field": "name"}])) == 1
 
 
+# -- run_query: aggregates -------------------------------------------------
+
+
+class TestRunQueryAggregates:
+    def test_count_all(self, agent, engine):
+        agent.run_insert("Book", [
+            {"title": "a", "price": 1.0, "author_id": None},
+            {"title": "b", "price": 2.0, "author_id": None},
+        ])
+        rows = agent.run_query([{"entity": "Book", "op": "count"}])
+        assert len(rows) == 1
+        assert rows[0]["count"] == 2
+
+    def test_count_with_filter(self, agent, engine):
+        agent.run_insert("Book", [
+            {"title": "a", "price": 5.0, "author_id": None},
+            {"title": "b", "price": 50.0, "author_id": None},
+        ])
+        rows = agent.run_query([
+            {"entity": "Book"},
+            {"field": "price", "op": "gt", "value": 10.0},
+            {"op": "count"},
+        ])
+        assert rows[0]["count"] == 1
+
+    def test_scalar_sum_and_avg(self, agent, engine):
+        agent.run_insert("Book", [
+            {"title": "a", "price": 10.0, "author_id": None},
+            {"title": "b", "price": 20.0, "author_id": None},
+        ])
+        sum_rows = agent.run_query([{"entity": "Book", "field": "price", "op": "sum"}])
+        assert sum_rows[0]["sum_price"] == pytest.approx(30.0)
+        avg_rows = agent.run_query([{"entity": "Book", "field": "price", "op": "avg"}])
+        assert avg_rows[0]["avg_price"] == pytest.approx(15.0)
+
+    def test_group_by_avg(self, agent, engine):
+        agent.run_insert("Author", [{"name": "A"}, {"name": "B"}])
+        with Session(engine) as s:
+            a1, a2 = s.query(Author).order_by(Author.id).all()
+        agent.run_insert("Book", [
+            {"title": "b1", "price": 10.0, "author_id": a1.id},
+            {"title": "b2", "price": 20.0, "author_id": a1.id},
+            {"title": "b3", "price": 15.0, "author_id": a2.id},
+        ])
+        rows = agent.run_query([
+            {"entity": "Book"},
+            {"field": "author_id", "op": "group_by"},
+            {"field": "price", "op": "avg"},
+        ])
+        by_aid = {r["author_id"]: r["avg_price"] for r in rows}
+        assert by_aid[a1.id] == pytest.approx(15.0)
+        assert by_aid[a2.id] == pytest.approx(15.0)
+
+    def test_join_group_by_related_entity_sum(self, agent, engine):
+        agent.run_insert("Author", [{"name": "Alice"}, {"name": "Bob"}])
+        with Session(engine) as s:
+            a1, a2 = s.query(Author).order_by(Author.id).all()
+        agent.run_insert("Book", [
+            {"title": "b1", "price": 10.0, "author_id": a1.id},
+            {"title": "b2", "price": 20.0, "author_id": a1.id},
+            {"title": "b3", "price": 15.0, "author_id": a2.id},
+        ])
+        rows = agent.run_query([
+            {"entity": "Book"},
+            {"op": "inner", "value": "author"},
+            {"entity": "Author", "field": "name", "op": "group_by"},
+            {"field": "price", "op": "sum"},
+        ])
+        by_name = {r["name"]: r["sum_price"] for r in rows}
+        assert by_name["Alice"] == pytest.approx(30.0)
+        assert by_name["Bob"] == pytest.approx(15.0)
+
+    def test_outer_desc_limit_on_aggregate(self, agent, engine):
+        agent.run_insert("Book", [
+            {"title": "a", "price": 1.0, "author_id": None},
+            {"title": "b", "price": 99.0, "author_id": None},
+            {"title": "c", "price": 50.0, "author_id": None},
+        ])
+        rows = agent.run_query([
+            {"entity": "Book"},
+            {"field": "price", "op": "group_by"},
+            {"field": "price", "op": "sum"},
+            {"field": "sum_price", "op": "desc"},
+            {"op": "limit", "value": 1},
+        ])
+        assert len(rows) == 1
+        assert rows[0]["sum_price"] == pytest.approx(99.0)
+
+
 # -- deferred entity resolution -------------------------------------------
 
 

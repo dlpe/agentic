@@ -5,6 +5,7 @@ from .ollama import Ollama
 from .chatgpt import ChatGPT
 from .gemini import Gemini
 from .copilot import Copilot
+from .claude import Claude
 from .output import OutputAgent
 from .sqlalchemy import SqlAlchemyAgent, describe_model
 from .scheduler import SchedulerAgent
@@ -16,6 +17,7 @@ __all__ = [
     "Function",
     "Usage",
     "ChatGPT",
+    "Claude",
     "Copilot",
     "Gemini",
     "Ollama",

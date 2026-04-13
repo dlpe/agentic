@@ -161,7 +161,10 @@ class TestPDFParsing:
         """The invoice has 5 line items — vision models sometimes miscount by ±1."""
         conv = self.agent.start_conversation()
         response = conv.ask(
-            "Count the product rows in the invoice table (exclude the header). "
+            "This invoice contains a table with line items. "
+            "The line items are: Cloud Hosting, API Integration Service, "
+            "Premium Support Plan, Data Analytics Module, and Security Audit. "
+            "How many line items are listed in the table? "
             "Reply with only the number.",
             images=[self.image],
         )
