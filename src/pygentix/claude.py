@@ -1,7 +1,9 @@
 """Anthropic (Claude) LLM backend for agents."""
 
+import base64
 import json
 import logging
+import mimetypes
 import os
 from typing import Any, Iterator
 
@@ -60,10 +62,65 @@ def prepare_claude_messages(messages: list[dict]) -> tuple[str, list[dict]]:
             else:
                 result.append({"role": "user", "content": [tool_result_block]})
 
+        elif role == "user" and msg.get("images"):
+            content_blocks = _build_user_file_blocks(msg)
+            result.append({"role": "user", "content": content_blocks})
+
         else:
             result.append({"role": role, "content": msg.get("content", "")})
 
     return "\n".join(system_parts), result
+
+
+IMAGE_MIMES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
+
+
+def _build_user_file_blocks(msg: dict) -> list[dict]:
+    """Build Anthropic content blocks for a user message with attached files."""
+    blocks: list[dict] = []
+
+    for path in msg["images"]:
+        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+
+        if mime in IMAGE_MIMES:
+            with open(path, "rb") as f:
+                data = base64.b64encode(f.read()).decode("utf-8")
+            blocks.append(
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": mime, "data": data},
+                }
+            )
+
+        elif mime == "application/pdf":
+            with open(path, "rb") as f:
+                data = base64.b64encode(f.read()).decode("utf-8")
+            blocks.append(
+                {
+                    "type": "document",
+                    "source": {"type": "base64", "media_type": mime, "data": data},
+                }
+            )
+
+        else:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                name = os.path.basename(path)
+                blocks.append(
+                    {
+                        "type": "text",
+                        "text": f"File contents of {name}:\n{content}",
+                    }
+                )
+            except (UnicodeDecodeError, OSError):
+                logger.warning("Cannot read file %s as text, skipping", path)
+
+    text = msg.get("content", "")
+    if text:
+        blocks.append({"type": "text", "text": text})
+
+    return blocks
 
 
 def convert_tools_for_claude(functions: dict) -> list[dict] | None:
