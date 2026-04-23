@@ -34,23 +34,39 @@ active_conversation: contextvars.ContextVar["Conversation | None"] = (
 
 logger = logging.getLogger("pygentix")
 
-DEFAULT_SYSTEM_PROMPT = (
-    "You are a helpful agent. "
-    "If you need a tool to answer the question, ALWAYS call tools immediately. "
-    "NEVER describe what you intend to do or ask for confirmation — just call the tool. "
-    "If you can provide the answer directly, do so. "
-    "If your answer doesn't call a tool, it must be the final answer. "
-    "No follow-up questions are allowed."
-    "You are not allowed to respond with SQL queries. You are only allowed to respond with the result of the SQL query."
-    "You are allowed to call tools again if you still don't have a satisfatory final answer that covers all the requirements asked."
-    "You are not allowed to respond with any other text than the satisfactory final answer."
-    "If your response does not contain any tool calls, it MUST be the final answer."
-    "If your response does not contain a satisfactroy final answer, you MUST call a tool again."
-    "You are not allowed to respond with SQL queries or instructions to the user in the content. You should NEVER tell them what to do."
-    "Unless the user specifically asks for a SQL query, you should NOT give them a SQL query as final response. You must call a tool instead."
-    "If your response is not satisfactory for the user's requirements but you cannot figure out how to get a satisfactory final answer, you MUST respond with 'I cannot answer this question.' and end the conversation."
-    "The content of your response should be the final answer or empty if you cannot answer the question. In such case you must include tool calls to fulfill the request."
-)
+DEFAULT_SYSTEM_PROMPT = """You are a tool-driven agent. Every reply you produce is one of exactly two kinds:
+
+KIND A — ACTION: a response whose ONLY payload is one or more tool calls. Its text content MUST be empty. No explanation, no preface, no plan.
+KIND B — FINAL ANSWER: a response with NO tool calls whose text content is the complete, user-facing answer to the original question, already computed from prior tool results.
+
+There is no third kind. Narration is banned.
+
+A reply is NARRATION (and therefore forbidden) if its text content does any of the following:
+- Says what you are about to do, plan to do, will do, need to do, or should do next.
+- Starts with or contains phrases like "Let me…", "Let's…", "I'll…", "I will…", "I'm going to…", "I need to…", "First I…", "Next I…", "Now I'll…", "To answer this…", "To calculate…", "To do this…", "Here's what I'll do…", "Sure, I'll…", "Okay, I'll…".
+- Ends with a trailing colon (":") that introduces a plan, a step, or data you have not yet produced.
+- Describes the tool, its arguments, the query, or the approach instead of producing the answer.
+- Asks the user for confirmation, clarification, or permission to continue.
+- Emits SQL, pseudo-code, or "I would run X" style explanations in place of calling the tool.
+
+If you catch yourself about to write narration, STOP and emit a tool call instead. The correct way to show intent is to call the tool, not to describe calling it.
+
+Decision procedure for every turn:
+1. Do you already have, from tool results in this conversation, every piece of data needed to fully answer the user? If yes, reply with KIND B (final answer only, no narration, no "here is the result:" preface).
+2. Otherwise, reply with KIND A: emit the tool call(s) needed. Text content MUST be empty. Do not announce the call.
+
+Final-answer rules (KIND B):
+- Give the answer directly. No lead-in, no restatement of the question, no "The result is…" unless that is the most natural phrasing of the answer itself.
+- Include the real values returned by the tools. Do not summarize away the data the user asked for.
+- Never output raw SQL, tool names, or tool arguments as the final answer unless the user explicitly asked for them.
+- If after calling tools you still cannot answer, reply with exactly: I cannot answer this question.
+
+Violations to avoid at all costs:
+- Replying "Let me calculate the sum of all opportunity values:" — this is narration. Instead, emit the tool call that computes the sum.
+- Replying "I'll run a query to fetch the data." — this is narration. Emit the query tool call with empty content.
+- Replying "First I need to look up the user, then compute the total." — this is narration. Emit the first tool call with empty content.
+
+Remember: the user never sees narration as helpful. They see only the final answer (KIND B) or the side effects of your tool calls (KIND A). Any text that is not the final answer itself is a bug."""
 
 TOOL_NUDGE = "Don't describe what you will do. Call the appropriate tool now."
 
@@ -163,31 +179,63 @@ class ChatResponse:
 class Function:
     """Introspectable wrapper around a callable, used to expose tools to an LLM.
 
-    Captures the function's signature and source code at wrap time so the
-    model backend can generate accurate tool definitions.  Attribute access
-    is proxied to the underlying function, which lets libraries like
-    ``ollama`` read ``__name__``, ``__doc__``, etc. transparently.
+    Captures the function's signature at wrap time so the backend can generate
+    accurate tool definitions.  Any parameter whose name matches a key in the
+    active :data:`active_scope` is filled from the scope at call time and
+    hidden from the LLM-visible tool schema, so the model cannot craft
+    arguments that widen access (e.g. by passing a different ``enterprise_id``).
+
+    A *serializer* may be provided to post-process the return value, and
+    *name* / *description* may be supplied to override ``func.__name__`` /
+    ``func.__doc__`` in the schema.
     """
 
-    def __init__(self, func: Callable) -> None:
+    def __init__(
+        self,
+        func: Callable,
+        *,
+        serializer: Callable[[Any], Any] | None = None,
+        description: str | None = None,
+        name: str | None = None,
+    ) -> None:
         self.func = func
         self.signature = inspect.signature(func)
-        self.code = inspect.getsource(func)
-        self.file = inspect.getfile(func)
+        try:
+            self.code = inspect.getsource(func)
+        except (OSError, TypeError):
+            self.code = ""
+        try:
+            self.file = inspect.getfile(func)
+        except TypeError:
+            self.file = ""
+        self._serializer = serializer
+        self._name_override = name
+        self._description_override = description
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        return self.func(*args, **kwargs)
+        scope = active_scope.get() or {}
+        for param_name in self.signature.parameters:
+            if (
+                param_name in scope
+                and param_name not in kwargs
+                and param_name != "self"
+            ):
+                kwargs[param_name] = scope[param_name]
+        result = self.func(*args, **kwargs)
+        if self._serializer is not None:
+            result = self._serializer(result)
+        return result
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.func, name)
 
     @property
     def name(self) -> str:
-        return self.func.__name__
+        return self._name_override or self.func.__name__
 
     @property
     def docs(self) -> str | None:
-        return self.func.__doc__
+        return self._description_override or self.func.__doc__
 
     @property
     def parameters(self) -> dict:
@@ -197,12 +245,20 @@ class Function:
         return f"Function({self.name})"
 
     def to_tool_schema(self) -> dict:
-        """Generate an OpenAI-compatible tool definition for this function."""
+        """Generate an OpenAI-compatible tool definition for this function.
+
+        Parameters whose name matches a key in the active scope are omitted —
+        they are filled automatically at call time and must never be part of
+        the LLM's visible surface.
+        """
         properties: dict[str, dict] = {}
         required: list[str] = []
+        scope_keys = set((active_scope.get() or {}).keys())
 
         for param_name, param in self.parameters.items():
             if param_name == "self":
+                continue
+            if param_name in scope_keys:
                 continue
             annotation = param.annotation
             if annotation is inspect.Parameter.empty:
@@ -347,9 +403,13 @@ class Conversation:
         self.trim_context()
         logger.info("User: %s", question[:120])
 
-        response = self.prompt_until_actionable(max_retries)
-        response = self.execute_tool_calls(response)
-        response = self.apply_output_schema(response)
+        scope_token = active_scope.set(self.scope)
+        try:
+            response = self.prompt_until_actionable(max_retries)
+            response = self.execute_tool_calls(response)
+            response = self.apply_output_schema(response)
+        finally:
+            active_scope.reset(scope_token)
 
         self.messages.append({"role": "assistant", "content": response.message.content})
         logger.info("Assistant: %s", response.message.content[:120])
@@ -375,20 +435,29 @@ class Conversation:
         self.trim_context()
         logger.info("User (stream): %s", question[:120])
 
-        if self.agent.functions:
-            response = self.prompt_until_actionable(max_retries)
-            if response.message.tool_calls:
-                response = self.execute_tool_calls(response)
-                yield from self.stream_final()
+        # Snapshot-restore instead of Token.reset(): a streaming generator is
+        # resumed by the caller (e.g. Starlette's threadpool) in a different
+        # Context on each iteration, so Token.reset() would raise ValueError
+        # when the finally block runs outside the Context the token came from.
+        previous_scope = active_scope.get()
+        active_scope.set(self.scope)
+        try:
+            if self.agent.functions:
+                response = self.prompt_until_actionable(max_retries)
+                if response.message.tool_calls:
+                    response = self.execute_tool_calls(response)
+                    yield from self.stream_final()
+                    return
+                response = self.apply_output_schema(response)
+                self.messages.append(
+                    {"role": "assistant", "content": response.message.content}
+                )
+                yield response.message.content
                 return
-            response = self.apply_output_schema(response)
-            self.messages.append(
-                {"role": "assistant", "content": response.message.content}
-            )
-            yield response.message.content
-            return
 
-        yield from self.stream_final()
+            yield from self.stream_final()
+        finally:
+            active_scope.set(previous_scope)
 
     async def ask_async(
         self,
@@ -410,9 +479,13 @@ class Conversation:
         self.trim_context()
         logger.info("User (async): %s", question[:120])
 
-        response = await self.prompt_until_actionable_async(max_retries)
-        response = await self.execute_tool_calls_async(response)
-        response = await self.apply_output_schema_async(response)
+        scope_token = active_scope.set(self.scope)
+        try:
+            response = await self.prompt_until_actionable_async(max_retries)
+            response = await self.execute_tool_calls_async(response)
+            response = await self.apply_output_schema_async(response)
+        finally:
+            active_scope.reset(scope_token)
 
         self.messages.append({"role": "assistant", "content": response.message.content})
         logger.info("Assistant (async): %s", response.message.content[:120])
@@ -429,11 +502,16 @@ class Conversation:
             if response.message.tool_calls:
                 return response
 
+            # Retry with a nudge whenever the model narrates instead of
+            # acting — small local models love to say "I will ..." and
+            # stop there, so non-empty content is still a miss, not a
+            # final answer. The prior-tool-result check keeps us from
+            # nudging a legitimate follow-up answer after a successful
+            # tool turn.
             should_retry = (
                 attempt < max_retries - 1
                 and self.agent.functions
                 and not self.has_prior_tool_result()
-                and not response.message.content.strip()
             )
             if should_retry:
                 self.messages.append(
@@ -562,11 +640,13 @@ class Conversation:
             if response.message.tool_calls:
                 return response
 
+            # Mirror the sync path: narration without a tool call is also
+            # a miss on weak models, so nudge rather than accepting text
+            # as the final answer.
             should_retry = (
                 attempt < max_retries - 1
                 and self.agent.functions
                 and not self.has_prior_tool_result()
-                and not response.message.content.strip()
             )
             if should_retry:
                 self.messages.append(
@@ -658,9 +738,19 @@ class Agent(ABC):
     system_prompt: str | None = None
     temperature: float = 0
 
+    # Registry: lets tools declared near the methods they expose reach the
+    # agent via :meth:`by_name` without importing the concrete instance.
+    # Populated when an agent is constructed with ``name=``.
+    registry: dict[str, "Agent"] = {}
+
+    # Registrations queued against a name that does not yet exist in the
+    # registry.  They are applied when an agent with that name is constructed.
+    pending_uses: dict[str, list[tuple[Callable, dict]]] = {}
+
     def __init__(
         self,
         *args: Any,
+        name: str | None = None,
         max_retries: int = 3,
         retry_delay: float = 1.0,
         **kwargs: Any,
@@ -670,11 +760,31 @@ class Agent(ABC):
         self.conversations: list[Conversation] = []
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.name = name
         self.hooks: dict[str, list[Callable]] = {
             "tool_call": [],
             "tool_result": [],
             "response": [],
         }
+        if name is not None:
+            if name in Agent.registry:
+                raise ValueError(f"Agent with name {name!r} is already registered")
+            Agent.registry[name] = self
+            for target, use_kwargs in Agent.pending_uses.pop(name, []):
+                self.add_tool(target, **use_kwargs)
+
+    @classmethod
+    def by_name(cls, name: str) -> "AgentRef":
+        """Return a lazy handle that forwards :meth:`uses` to the named agent.
+
+        Adapter: lets model modules declare their tools with
+        ``@Agent.by_name("CRMAgent").uses(...)`` without importing the agent
+        instance itself.  If the agent has not been constructed yet, the
+        registration is queued and flushed on construction; this sidesteps
+        import-ordering problems between the agent module and the modules
+        that contribute tools to it.
+        """
+        return AgentRef(name)
 
     # -- hooks -------------------------------------------------------------
 
@@ -760,16 +870,50 @@ class Agent(ABC):
 
     # -- tool registration -------------------------------------------------
 
-    def uses(self, func: Callable) -> Callable:
-        """Register *func* as a tool the agent can invoke."""
-        f = Function(func)
+    def add_tool(
+        self,
+        func: Callable,
+        *,
+        serializer: Callable[[Any], Any] | None = None,
+        description: str | None = None,
+        name: str | None = None,
+    ) -> None:
+        """Wrap *func* as a :class:`Function` and store it on this agent."""
+        f = Function(func, serializer=serializer, description=description, name=name)
         self.functions[f.name] = f
 
-        @wraps(func)
-        def wrapped(*args: Any, **kwargs: Any) -> Any:
-            return func(*args, **kwargs)
+    def uses(
+        self,
+        func: Callable | None = None,
+        *,
+        serializer: Callable[[Any], Any] | None = None,
+        description: str | None = None,
+        name: str | None = None,
+    ) -> Callable:
+        """Register *func* as a tool the agent can invoke.
 
-        return wrapped
+        Accepts all three decorator shapes (bare, parameterised, direct call).
+        Also bound on :class:`AgentRef` so ``@Agent.by_name(...).uses(...)``
+        runs this exact body against a lazy handle — the only thing that
+        differs between the two code paths is :meth:`add_tool`.
+
+        Any parameter of *func* whose name matches a key in the conversation
+        :data:`active_scope` is auto-injected at call time and hidden from
+        the LLM-visible tool schema, so the model can't widen access by
+        passing its own ``enterprise_id`` / ``user_id`` / etc.
+        """
+        kwargs = {"serializer": serializer, "description": description, "name": name}
+
+        def apply(target: Callable) -> Callable:
+            self.add_tool(target, **kwargs)
+
+            @wraps(target)
+            def passthrough(*args: Any, **kw: Any) -> Any:
+                return target(*args, **kw)
+
+            return passthrough
+
+        return apply if func is None else apply(func)
 
     # -- chat methods ------------------------------------------------------
 
@@ -807,9 +951,10 @@ class Agent(ABC):
     ) -> Conversation:
         """Begin a new conversation.
 
-        The system prompt is always ``DEFAULT_SYSTEM_PROMPT`` and cannot
-        be overridden.  An optional *prompt* is injected as the first
-        user message to give the conversation extra context.
+        The system prompt is always :data:`DEFAULT_SYSTEM_PROMPT` and cannot
+        be overridden. Mixins that need extra context (DB schema, output
+        schema, etc.) append to ``conv.messages[0]["content"]`` after the
+        conversation is built rather than replacing the prompt.
 
         Parameters
         ----------
@@ -834,3 +979,26 @@ class Agent(ABC):
             conv.messages.append({"role": "user", "content": prompt})
         self.conversations.append(conv)
         return conv
+
+
+class AgentRef:
+    """Lazy handle to an :class:`Agent`, resolved by name at registration time.
+
+    Reuses :meth:`Agent.uses` wholesale — only :meth:`add_tool` differs,
+    forwarding to the live agent if it exists or queuing on
+    :attr:`Agent.pending_uses` otherwise.
+    """
+
+    __slots__ = ("target_name",)
+
+    def __init__(self, target_name: str) -> None:
+        self.target_name = target_name
+
+    def add_tool(self, func: Callable, **kwargs: Any) -> None:
+        agent = Agent.registry.get(self.target_name)
+        if agent is not None:
+            agent.add_tool(func, **kwargs)
+        else:
+            Agent.pending_uses.setdefault(self.target_name, []).append((func, kwargs))
+
+    uses = Agent.uses

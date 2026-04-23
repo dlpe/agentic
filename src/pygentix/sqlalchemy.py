@@ -193,12 +193,19 @@ class SqlAlchemyAgent(Agent):
                         getattr(current_cls, col_name) == scope[scope_key],
                     )
             else:
-                fk_col_name, target_cls = link[0], link[1]
-                pk_col = sa_inspect(target_cls).primary_key[0]
+                # 2-tuple: (fk_col_on_current, TargetCls) joins current.fk == target.pk
+                # 3-tuple: (col_on_current, TargetCls, col_on_target) joins current.col == target.col
+                # — needed when the relationship goes through a bridge / back-reference
+                # table where the target side (not current) holds the foreign key.
+                col_on_current, target_cls = link[0], link[1]
+                if len(link) >= 3:
+                    target_col = getattr(target_cls, link[2])
+                else:
+                    pk_col = sa_inspect(target_cls).primary_key[0]
+                    target_col = getattr(target_cls, pk_col.key)
                 query = query.join(
                     target_cls,
-                    getattr(current_cls, fk_col_name)
-                    == getattr(target_cls, pk_col.key),
+                    getattr(current_cls, col_on_current) == target_col,
                 )
                 current_cls = target_cls
         return query

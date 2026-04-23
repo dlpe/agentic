@@ -72,7 +72,14 @@ class OutputAgent(Agent):
             return obj
 
     def start_conversation(self, **kwargs: Any):
-        """Inject a schema-enforcement hint into the system prompt."""
+        """Inject a schema-enforcement hint into the system prompt.
+
+        The base ``Agent`` locks the system prompt to
+        :data:`DEFAULT_SYSTEM_PROMPT`, so we append the schema hint to
+        the already-built system message — same pattern
+        :class:`SqlAlchemyAgent` uses for its DB context.
+        """
+        conv = super().start_conversation(**kwargs)
         if self.output_schema:
             hint = (
                 "\n\nYour final responses MUST be valid JSON matching this schema: "
@@ -80,8 +87,8 @@ class OutputAgent(Agent):
                 "ALWAYS include the complete actual data returned by tools. "
                 "Never give vague summaries — put the real values in your response."
             )
-            kwargs["system"] = kwargs.get("system", "") + hint
-        return super().start_conversation(**kwargs)
+            conv.messages[0]["content"] += hint
+        return conv
 
     # -- schema generation -------------------------------------------------
 

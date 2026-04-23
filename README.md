@@ -100,6 +100,38 @@ response = conv.ask("Find docs about authentication and email them to alice@co.c
 
 The framework introspects the function's signature and docstring to build the tool definition automatically. When the model decides to call a tool, the framework executes it and feeds the result back — looping until the model produces a final answer.
 
+### Parameterised `@uses` — serializer, description, name
+
+`@agent.uses` also accepts optional keyword arguments so you can decorate an existing method (or a callable) without writing a thin wrapper around it:
+
+```python
+from pygentix import ChatGPT
+
+agent = ChatGPT()
+
+@agent.uses(
+    serializer=lambda rows: [r.model_dump(mode="json") for r in rows],
+    name="get_open_tickets",
+    description="Return every open support ticket, serialised as plain dicts.",
+)
+def fetch_open_tickets() -> list:
+    return TicketRepo.query_open()
+```
+
+| Kwarg | Purpose |
+|---|---|
+| `serializer` | Post-processes the return value before it reaches the LLM (e.g. ORM → JSON-safe dict). |
+| `description` | Overrides `func.__doc__` in the tool schema the LLM sees. |
+| `name` | Overrides `func.__name__` in the tool schema — handy for exposing repository methods under friendlier tool names. |
+
+All three forms are interchangeable:
+
+```python
+@agent.uses                                        # bare decorator
+@agent.uses(serializer=to_dicts, name="search")    # parameterised decorator
+agent.uses(Repo.search, serializer=to_dicts)       # direct call
+```
+
 ---
 
 ## Vision / Image Understanding
@@ -382,9 +414,99 @@ conv = agent.start_conversation(
 # 2. Scope:  constrain query to current_user's data ✓
 ```
 
+### Scope-Aware Tools (works on any `@uses`)
+
+`SqlAlchemyAgent` isn't the only thing that understands scope. **Every** tool registered with `@agent.uses` participates too: any parameter whose name matches a key in the active conversation scope is auto-filled at call time and hidden from the LLM-visible tool schema. The model literally cannot supply those arguments, so it cannot widen access by crafting different inputs.
+
+```python
+from pygentix import ChatGPT
+
+agent = ChatGPT()
+
+@agent.uses(serializer=dump_list)
+def get_my_opportunities(enterprise_id: str) -> list:
+    """Return every opportunity in the logged-in user's enterprise."""
+    return Opportunities.query_by_enterprise(enterprise_id)
+
+conv = agent.start_conversation(scope={
+    "user_id": "u_42",
+    "enterprise_id": "ent_7",
+    "role": "sales",
+})
+conv.ask("Show me my pipeline")
+# Framework calls get_my_opportunities(enterprise_id="ent_7").
+# The LLM sees get_my_opportunities() as a zero-argument tool.
+```
+
+Parameters **not** in scope remain visible to the LLM as normal arguments, so you can mix LLM-supplied and scope-supplied parameters freely:
+
+```python
+@agent.uses
+def search_my_tickets(enterprise_id: str, keyword: str) -> list:
+    """Search tickets in the caller's enterprise by keyword."""
+    return TicketRepo.search(enterprise_id, keyword)
+
+# LLM sees: search_my_tickets(keyword: str)
+# Framework injects enterprise_id from scope at call time.
+```
+
+This is an **adapter / security boundary** — the scope dict built from the authenticated session is the only place scoped values ever come from.
+
 ### No scope = unrestricted (backward compatible)
 
 If you don't pass `scope` or `policy`, everything works exactly as before — no filters, no restrictions.
+
+---
+
+## Named Agents & Lazy Tool Registration
+
+Large codebases often want to declare a tool next to the function it exposes (e.g. on a repository / model class) without centralising every registration in a single bootstrap module. Two library pieces make that safe regardless of import order:
+
+1. Construct the agent with a `name=`. The instance registers itself in `Agent.registry` under that name.
+2. Reference it from anywhere via `Agent.by_name(...)`, which returns a lazy `AgentRef`. Its `.uses(...)` is the **same decorator** as `Agent.uses` — if the named agent already exists the registration runs immediately, otherwise it's queued and flushed as soon as an agent with that name is constructed.
+
+```python
+# app/core/agent.py — built during startup
+from pygentix import ChatGPT
+
+agent = ChatGPT(name="CRMAgent", api_key=...)
+```
+
+```python
+# app/models/opportunity.py — declares its scoped tool in place
+from pygentix import Agent
+
+class Opportunities(Base):
+    ...
+
+    @staticmethod
+    @Agent.by_name("CRMAgent").uses(
+        serializer=dump_list,
+        name="get_my_opportunities",
+        description="Return every opportunity in the caller's enterprise.",
+    )
+    def get_all_by_enterprise_id(enterprise_id: str) -> list:
+        ...
+```
+
+- Either module can be imported first. If models load before the agent is constructed, their registrations sit on `Agent.pending_uses["CRMAgent"]` and flush on construction.
+- `Agent.by_name(...)` accepts exactly the same `serializer` / `description` / `name` kwargs as `@agent.uses`, because `AgentRef.uses` **is** `Agent.uses` (shared via attribute aliasing — not a reimplementation).
+- Names must be unique: constructing two agents with the same `name=` raises `ValueError`.
+
+When combined with scope-aware tools (see above), this pattern lets each model own its scoped tools while the endpoint only wires up authentication and starts the conversation:
+
+```python
+# app/api/chat.py
+from pygentix import Agent
+from app.core.agent import agent   # makes sure CRMAgent exists
+import app.models                  # triggers all @Agent.by_name("CRMAgent").uses decorators
+
+@router.post("/chat")
+def chat(..., current_user = Depends(verify_token)):
+    scope = {"user_id": current_user.id, "enterprise_id": current_user.enterprise_id}
+    conv = agent.start_conversation(scope=scope)
+    ...
+```
 
 ---
 
@@ -730,9 +852,11 @@ Set to `WARNING` in production to silence informational logs.
 | Symbol | Description |
 |---|---|
 | `Agent` | Abstract base class — subclass to create a backend |
+| `Agent.by_name(name)` | Lazy handle (`AgentRef`) for registering tools against a named agent from anywhere |
+| `Agent.registry` | Mapping of `name` → live `Agent` instance, populated when `name=` is passed to the constructor |
 | `ChatResponse` | Normalized response every backend returns |
 | `Conversation` | Multi-turn conversation with save/load, streaming, async |
-| `Function` | Introspectable wrapper around a tool callable |
+| `Function` | Introspectable wrapper around a tool callable; supports optional `serializer`, `description`, `name` overrides |
 | `Usage` | Token usage statistics (prompt, completion, total) |
 
 ### Backends
