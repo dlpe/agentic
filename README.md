@@ -134,6 +134,98 @@ agent.uses(Repo.search, serializer=to_dicts)       # direct call
 
 ---
 
+## Tabular data: register, then reduce
+
+When a tool would return a **large** `list[dict]` (query results, exports, analytics rows), sending every row to the model wastes tokens and context. pygentix provides an optional **two-step tabular workflow**:
+
+1. **`tabular_register`** — store rows for the **current** `Conversation` (via `active_conversation`) and return a short JSON payload: `dataset_id`, `row_count`, and `column` names.
+2. **`tabular_reduce`** — run **filters**, optional **group_by**, and **metrics** (`sum`, `count`, `avg`, `min`, `max`) on that dataset; only the **small aggregate result** goes back to the model.
+
+Reduction is pure Python (no second LLM call on the bulk payload). Storage lives on the conversation object, so it is not shared across users or unrelated chats.
+
+### Register the tools
+
+Call **once** after you construct the agent (same pattern as other `add_tool` usage):
+
+```python
+from pygentix import Claude, register_tabular_tools
+
+agent = Claude(name="MyAgent", api_key="...")
+register_tabular_tools(agent)
+```
+
+Optional kwargs: `max_rows_per_dataset` (default `100_000`), `max_datasets` (default `32`, FIFO eviction), `register_name` / `reduce_name` if you need to avoid name clashes.
+
+If the agent is registered **by name** before the instance exists, pass the name string — registrations queue the same way as `@Agent.by_name("MyAgent").uses(...)`:
+
+```python
+register_tabular_tools("MyAgent")
+agent = Claude(name="MyAgent", ...)  # tools attach on construction
+```
+
+### What the model sees
+
+**`tabular_register(rows)`** — argument is a JSON array of objects. Returns a string of JSON like:
+
+```json
+{
+  "dataset_id": "ds_…",
+  "row_count": 5000,
+  "columns": ["id", "amount", "owner"],
+  "hint": "Call tabular_reduce with this dataset_id …"
+}
+```
+
+**`tabular_reduce(dataset_id, spec_json)`** — `spec_json` is a **string** containing a JSON object:
+
+| Key | Required | Meaning |
+|-----|----------|---------|
+| `metrics` | yes | List of `{ "op": "sum"\|"count"\|"avg"\|"min"\|"max", "field"?: "…", "as"?: "…" }`. For `count`, omit `field` to count rows; with `field`, count non-null values. |
+| `group_by` | no | List of field names; each output row includes those keys plus metric columns. |
+| `where` | no | List of `{ "field", "op", "value" }` with `op` in `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`. |
+
+Field names must match `^[A-Za-z_][A-Za-z0-9_]*$`.
+
+Example `spec_json` (pretty-printed; send minified or as a single line from the app):
+
+```json
+{
+  "group_by": ["owner"],
+  "metrics": [
+    { "op": "sum", "field": "amount", "as": "total_amount" },
+    { "op": "count", "as": "n" }
+  ],
+  "where": [{ "field": "amount", "op": "gte", "value": 100 }]
+}
+```
+
+Response shape: `{"rows": [ { … grouped keys + metrics … }, … ]}`.
+
+### Typical integration pattern
+
+Heavy work stays **inside your own tool** (DB query, CSV parse, etc.). You build `list[dict]` in Python, then either:
+
+- Return only **`tabular_register(rows)`**’s JSON to the model and let it call **`tabular_reduce`** for the analysis it wants, or  
+- Call **`reduce_tabular_rows(rows, spec)`** yourself (same logic, no tool) if you do not need the model to choose the spec.
+
+```python
+from pygentix.tabular import reduce_tabular_rows
+
+rows = [{"owner": "a", "amount": 10.0}, {"owner": "b", "amount": 5.0}]
+out = reduce_tabular_rows(
+    rows,
+    {
+        "group_by": ["owner"],
+        "metrics": [{"op": "sum", "field": "amount", "as": "t"}],
+    },
+)
+# → [{'owner': 'a', 't': 10.0}, {'owner': 'b', 't': 5.0}]
+```
+
+Public symbols: `register_tabular_tools`, `reduce_tabular_rows`, `TabularStore` (for embedding the store elsewhere). See `pygentix/tabular.py` for full behaviour.
+
+---
+
 ## Vision / Image Understanding
 
 Pass images alongside your question to any vision-capable model:
@@ -876,6 +968,9 @@ Set to `WARNING` in production to silence informational logs.
 | `SchedulerAgent` | Schedule tool calls and conversations for future execution |
 | `SqlAlchemyAgent` | Database CRUD tools from ORM models |
 | `MockAgent` | Fake backend for unit testing (`pygentix.testing`) |
+| `register_tabular_tools` | Adds `tabular_register` / `tabular_reduce` for large row lists (`pygentix.tabular`) |
+| `reduce_tabular_rows` | Pure in-memory group / filter / metrics over `list[dict]` |
+| `TabularStore` | Conversation-attached row store used by the tabular tools |
 
 ---
 
@@ -887,6 +982,8 @@ cd pygentix
 pip install -e ".[dev]"
 pytest
 ```
+
+Integration tests (`tests/test_integration.py`, `tests/test_vision.py`) always call **local Ollama** (no pytest skip). Pull **`qwen2.5:7b`** (integration default — stronger models often finish sooner in *wall time* than tiny ones because they need fewer tool/retry rounds; use `PYGENTIX_OLLAMA_TEST_MODEL=qwen2.5:3b` if you prefer the smallest weights) and **`llama3.2-vision`** (vision; override with `PYGENTIX_OLLAMA_VISION_MODEL`) before `pytest`. If startup hangs on `ollama pull`, set **`PYGENTIX_OLLAMA_NO_AUTO_PULL=1`** and keep models pre-installed. PDF tests need **PyMuPDF** (`pip install pymupdf`).
 
 ---
 

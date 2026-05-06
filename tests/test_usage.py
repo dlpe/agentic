@@ -1,6 +1,6 @@
 """Tests for token usage tracking."""
 
-from pygentix.core import ChatResponse, Usage
+from pygentix.core import ChatResponse, Usage, normalize_tool_arguments
 from pygentix.testing import MockAgent
 
 
@@ -50,3 +50,33 @@ class TestUsage:
         resp = conv.ask("anything")
         assert resp.usage.prompt_tokens == 50
         assert resp.usage.total_tokens == 75
+
+
+class TestNormalizeToolArguments:
+    def test_dict_unchanged(self):
+        assert normalize_tool_arguments({"a": 1}) == {"a": 1}
+
+    def test_json_object_string(self):
+        assert normalize_tool_arguments(' {"x": 2} ') == {"x": 2}
+
+    def test_none_empty(self):
+        assert normalize_tool_arguments(None) == {}
+        assert normalize_tool_arguments("") == {}
+
+
+class TestChatResponseToolArgumentNormalization:
+    def test_string_arguments_become_dict(self):
+        resp = ChatResponse(
+            content="",
+            tool_calls=[
+                {
+                    "name": "foo",
+                    "arguments": '{"entity": "Customer", "values": {"name": "A"}}',
+                    "id": "1",
+                }
+            ],
+        )
+        tc = resp.message.tool_calls[0]
+        assert tc.function.name == "foo"
+        assert tc.function.arguments == {"entity": "Customer", "values": {"name": "A"}}
+        assert tc.id == "1"

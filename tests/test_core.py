@@ -2,7 +2,7 @@
 
 from unittest.mock import MagicMock
 
-from pygentix.core import Conversation, Function
+from pygentix.core import ChatResponse, Conversation, Function
 
 
 # -- Function --------------------------------------------------------------
@@ -44,7 +44,7 @@ class TestHasPriorToolResult:
     def make_conversation(self):
         mock_agent = MagicMock()
         mock_agent.functions = {"some_tool": lambda: None}
-        return Conversation(mock_agent, "system prompt")
+        return Conversation(mock_agent)
 
     def test_false_when_no_messages(self):
         conv = self.make_conversation()
@@ -69,10 +69,10 @@ class TestHasPriorToolResult:
         assert conv.has_prior_tool_result() is False
 
 
-# -- Conversation retry logic ----------------------------------------------
+# -- Conversation single-shot prompt ---------------------------------------
 
 
-class TestConversationRetry:
+class TestConversationPrompting:
     def make_mock_response(self, content="", tool_calls=None):
         resp = MagicMock()
         resp.message.content = content
@@ -92,7 +92,7 @@ class TestConversationRetry:
         ]
         mock_agent.functions = {"tool": lambda: "ok"}
 
-        conv = Conversation(mock_agent, "system")
+        conv = Conversation(mock_agent)
         conv.ask("do something")
         assert mock_agent.chat.call_count == 2
 
@@ -102,52 +102,42 @@ class TestConversationRetry:
         mock_agent.functions = {}
         mock_agent.chat.return_value = self.make_mock_response(content="answer")
 
-        conv = Conversation(mock_agent, "system")
+        conv = Conversation(mock_agent)
         resp = conv.ask("question")
         assert resp.message.content == "answer"
         assert mock_agent.chat.call_count == 1
 
-    def test_retries_when_text_only_and_functions_exist(self):
+    def test_single_prompt_when_model_narrates_without_tools(self):
         mock_agent = MagicMock()
         mock_agent.output_schema = None
-        tool_call = MagicMock()
-        tool_call.function.name = "tool"
-        tool_call.function.arguments = {}
-
-        mock_agent.chat.side_effect = [
-            self.make_mock_response(content="I will..."),
-            self.make_mock_response(tool_calls=[tool_call]),
-            self.make_mock_response(content="done"),
-        ]
         mock_agent.functions = {"tool": lambda: "ok"}
+        mock_agent.chat.return_value = self.make_mock_response(content="I will...")
 
-        conv = Conversation(mock_agent, "system")
+        conv = Conversation(mock_agent)
         conv.ask("do it")
-        nudge_msgs = [m for m in conv.messages if "Don't describe" in m.get("content", "")]
-        assert len(nudge_msgs) == 1
+        assert mock_agent.chat.call_count == 1
+        assert not any(
+            "Don't describe" in str(m.get("content", "")) for m in conv.messages
+        )
 
-    def test_retries_on_new_question_after_prior_tool_turn(self):
+    def test_single_prompt_after_prior_tool_messages(self):
         mock_agent = MagicMock()
         mock_agent.output_schema = None
-        tool_call = MagicMock()
-        tool_call.function.name = "tool"
-        tool_call.function.arguments = {}
-
-        mock_agent.chat.side_effect = [
-            self.make_mock_response(content="Let me think..."),
-            self.make_mock_response(tool_calls=[tool_call]),
-            self.make_mock_response(content="done"),
-        ]
         mock_agent.functions = {"tool": lambda: "ok"}
+        mock_agent.chat.return_value = self.make_mock_response(content="Let me think...")
 
-        conv = Conversation(mock_agent, "system")
+        conv = Conversation(mock_agent)
         conv.messages.append({"role": "user", "content": "first"})
         conv.messages.append({"role": "assistant", "content": ""})
-        conv.messages.append({"role": "tool", "tool_name": "tool", "content": "prior data"})
+        conv.messages.append(
+            {"role": "tool", "tool_name": "tool", "content": "prior data"}
+        )
 
         conv.ask("new question")
-        nudge_msgs = [m for m in conv.messages if "Don't describe" in m.get("content", "")]
-        assert len(nudge_msgs) == 1
+        assert mock_agent.chat.call_count == 1
+        assert not any(
+            "Don't describe" in str(m.get("content", "")) for m in conv.messages
+        )
 
     def test_final_response_is_recorded_in_history(self):
         mock_agent = MagicMock()
@@ -155,9 +145,31 @@ class TestConversationRetry:
         mock_agent.functions = {}
         mock_agent.chat.return_value = self.make_mock_response(content="the answer")
 
-        conv = Conversation(mock_agent, "system")
+        conv = Conversation(mock_agent)
         conv.ask("question")
 
         last = conv.messages[-1]
         assert last["role"] == "assistant"
         assert last["content"] == "the answer"
+
+
+class TestApplyOutputSchemaShortcut:
+    def test_skips_second_chat_when_final_content_is_json_object(self):
+        mock_agent = MagicMock()
+        mock_agent.output_schema = {"type": "object"}
+        conv = Conversation(mock_agent)
+        payload = '{"answer":"done","data":[]}'
+        out = conv.apply_output_schema(ChatResponse(content=payload))
+        mock_agent.chat.assert_not_called()
+        assert out.message.content == payload
+
+    def test_appends_non_json_draft_then_calls_chat(self):
+        mock_agent = MagicMock()
+        mock_agent.output_schema = {"type": "object"}
+        conv = Conversation(mock_agent)
+        conv.messages.append({"role": "user", "content": "go"})
+        mock_agent.chat.return_value = ChatResponse(content='{"answer":"ok","data":[]}')
+        out = conv.apply_output_schema(ChatResponse(content="thinking aloud"))
+        mock_agent.chat.assert_called_once()
+        assert conv.messages[-1]["content"] == "thinking aloud"
+        assert out.message.content == '{"answer":"ok","data":[]}'

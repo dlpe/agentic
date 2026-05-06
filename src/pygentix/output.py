@@ -20,9 +20,10 @@ class OutputAgent(Agent):
             text: str
             confidence: float = 0.0
 
-    When a schema is set, :meth:`start_conversation` injects a hint into
-    the system prompt and the conversation pipeline applies an Ollama
-    ``format`` constraint on the final response.
+    When a schema is set, :meth:`start_conversation` registers a schema
+    hint via :meth:`~pygentix.core.Conversation.append_system_supplement`, and
+    the conversation pipeline applies a ``format`` constraint on the final
+    response when the backend supports it.
     """
 
     PYTHON_TO_JSON: dict[type, str] = {
@@ -74,20 +75,20 @@ class OutputAgent(Agent):
     def start_conversation(self, **kwargs: Any):
         """Inject a schema-enforcement hint into the system prompt.
 
-        The base ``Agent`` locks the system prompt to
-        :data:`DEFAULT_SYSTEM_PROMPT`, so we append the schema hint to
-        the already-built system message — same pattern
-        :class:`SqlAlchemyAgent` uses for its DB context.
+        The base ``Agent`` locks the core policy to
+        :data:`DEFAULT_SYSTEM_PROMPT`; we register extra instructions with
+        :meth:`~pygentix.core.Conversation.append_system_supplement`, same as
+        :class:`SqlAlchemyAgent` for database context.
         """
         conv = super().start_conversation(**kwargs)
         if self.output_schema:
             hint = (
-                "\n\nYour final responses MUST be valid JSON matching this schema: "
+                "Your final responses MUST be valid JSON matching this schema: "
                 f"{json.dumps(self.output_schema)}\n"
                 "ALWAYS include the complete actual data returned by tools. "
                 "Never give vague summaries — put the real values in your response."
             )
-            conv.messages[0]["content"] += hint
+            conv.append_system_supplement(hint)
         return conv
 
     # -- schema generation -------------------------------------------------

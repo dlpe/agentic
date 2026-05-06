@@ -1,6 +1,8 @@
 """Ollama LLM backend for agents."""
 
 import logging
+import os
+from pathlib import Path
 from typing import Any, Iterator
 
 from .core import Agent, ChatResponse, Usage
@@ -21,16 +23,28 @@ def prepare_ollama_messages(messages: list[dict]) -> list[dict]:
         role = msg["role"]
 
         if role == "assistant" and msg.get("tool_calls"):
-            result.append({
-                "role": "assistant",
-                "content": msg.get("content") or "",
-                "tool_calls": [
-                    {"function": {"name": tc["name"], "arguments": tc["arguments"]}}
-                    for tc in msg["tool_calls"]
-                ],
-            })
+            result.append(
+                {
+                    "role": "assistant",
+                    "content": msg.get("content") or "",
+                    "tool_calls": [
+                        {"function": {"name": tc["name"], "arguments": tc["arguments"]}}
+                        for tc in msg["tool_calls"]
+                    ],
+                }
+            )
         elif role == "tool":
             result.append({"role": "tool", "content": msg["content"]})
+        elif role == "user" and msg.get("images"):
+            # Ollama expects ``images`` as paths / base64-friendly values (see ``ollama._types.Image``).
+            paths = [Path(p) if not isinstance(p, Path) else p for p in msg["images"]]
+            result.append(
+                {
+                    "role": "user",
+                    "content": msg.get("content") or "",
+                    "images": paths,
+                }
+            )
         else:
             result.append(msg)
 
@@ -41,7 +55,11 @@ def extract_usage(response: Any) -> Usage:
     """Pull token counts from an Ollama response object."""
     prompt = getattr(response, "prompt_eval_count", 0) or 0
     completion = getattr(response, "eval_count", 0) or 0
-    return Usage(prompt_tokens=prompt, completion_tokens=completion, total_tokens=prompt + completion)
+    return Usage(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        total_tokens=prompt + completion,
+    )
 
 
 DEFAULT_OPTIONS: dict[str, Any] = {"temperature": 0, "top_k": 1, "seed": 42}
@@ -57,6 +75,10 @@ class Ollama(Agent):
     options:
         Ollama sampling options.  Merged on top of deterministic defaults
         (``temperature=0``, ``top_k=1``, ``seed=42``).
+    client_timeout:
+        Seconds for each HTTP call to Ollama (passed to ``httpx`` via
+        ``ollama.Client``).  If ``None``, reads ``PYGENTIX_OLLAMA_HTTP_TIMEOUT_SEC``;
+        if that is unset, uses unbounded waits (same as the library default client).
     """
 
     def __init__(
@@ -64,41 +86,55 @@ class Ollama(Agent):
         model: str = "qwen2.5:7b",
         *args: Any,
         options: dict[str, Any] | None = None,
+        client_timeout: float | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.model = model
         self.options = {**DEFAULT_OPTIONS, **(options or {})}
+        timeout_sec: float | None = client_timeout
+        if timeout_sec is None:
+            raw = os.environ.get("PYGENTIX_OLLAMA_HTTP_TIMEOUT_SEC", "").strip()
+            if raw:
+                timeout_sec = float(raw)
+        from ollama import Client
+
+        self.ollama_client = (
+            Client(timeout=timeout_sec) if timeout_sec is not None else Client()
+        )
         self.ensure_model_available()
 
     def ensure_model_available(self) -> None:
-        from ollama import list as ollama_list, pull as ollama_pull
+        flag = os.environ.get("PYGENTIX_OLLAMA_NO_AUTO_PULL", "").strip().lower()
+        if flag in ("1", "true", "yes", "on"):
+            return
 
-        response = ollama_list()
+        response = self.ollama_client.list()
         model_entries = getattr(response, "models", []) or []
         installed = {
-            getattr(m, "model", None) or getattr(m, "name", None)
-            for m in model_entries
+            getattr(m, "model", None) or getattr(m, "name", None) for m in model_entries
         }
         installed.discard(None)
 
         if self.model not in installed:
-            ollama_pull(self.model)
+            self.ollama_client.pull(self.model)
 
     def chat(self, messages: list[dict], **kwargs: Any) -> ChatResponse:
         """Forward *messages* to the Ollama model and return a :class:`ChatResponse`."""
-        from ollama import chat as ollama_chat
-
         fmt = kwargs.pop("format", None)
 
         def do_call() -> Any:
-            return ollama_chat(
-                model=self.model,
-                messages=prepare_ollama_messages(messages),
-                tools=list(self.functions.values()),
-                options=self.options,
-                **({"format": fmt} if fmt else {}),
-            )
+            omsgs = prepare_ollama_messages(messages)
+            kw: dict[str, Any] = {
+                "model": self.model,
+                "messages": omsgs,
+                "options": self.options,
+            }
+            if self.functions:
+                kw["tools"] = list(self.functions.values())
+            if fmt:
+                kw["format"] = fmt
+            return self.ollama_client.chat(**kw)
 
         response = self.with_retry(do_call)
 
@@ -117,14 +153,16 @@ class Ollama(Agent):
 
     def chat_stream(self, messages: list[dict], **kwargs: Any) -> Iterator[str]:
         """Yield content chunks via Ollama's native streaming."""
-        from ollama import chat as ollama_chat
-
-        stream = ollama_chat(
-            model=self.model,
-            messages=prepare_ollama_messages(messages),
-            options=self.options,
-            stream=True,
-        )
+        omsgs = prepare_ollama_messages(messages)
+        skw: dict[str, Any] = {
+            "model": self.model,
+            "messages": omsgs,
+            "options": self.options,
+            "stream": True,
+        }
+        if self.functions:
+            skw["tools"] = list(self.functions.values())
+        stream = self.ollama_client.chat(**skw)
         for chunk in stream:
             text = chunk.message.content
             if text:

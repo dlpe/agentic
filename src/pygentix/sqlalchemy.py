@@ -1,5 +1,6 @@
 """SQLAlchemy database integration for agents."""
 
+import json
 import logging
 from datetime import date, datetime
 from typing import Any
@@ -416,10 +417,32 @@ class SqlAlchemyAgent(Agent):
             rows = session.execute(outer).fetchall()
             return [self.row_to_dict(row, entity_cls) for row in rows]
 
-    def run_insert(self, entity: str, values: dict | list[dict]) -> str:
+    @staticmethod
+    def parse_tool_json_argument(value: Any) -> Any:
+        """Parse JSON when the model passes a string instead of structured tool args."""
+        if not isinstance(value, str):
+            return value
+        stripped = value.strip()
+        if not stripped or stripped[0] not in "[{":
+            return value
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            return value
+
+    def run_insert(self, entity: str, values: dict | list[dict] | str) -> str:
         """Insert one or many rows.  Accepts a dict or a list of dicts."""
         cls = self.writable[entity]
-        records = values if isinstance(values, list) else [values]
+        values = self.parse_tool_json_argument(values)
+        if isinstance(values, dict):
+            records = [values]
+        elif isinstance(values, list):
+            records = values
+        else:
+            raise TypeError(
+                "run_insert values must be dict, list[dict], or a JSON string of either, "
+                f"not {type(values).__name__}",
+            )
         columns = sa_inspect(cls).columns
         inserted = []
 
@@ -437,6 +460,12 @@ class SqlAlchemyAgent(Agent):
     def run_update(self, entity: str, filters: dict, values: dict) -> str:
         """Update rows matching *filters* with new *values*."""
         cls = self.writable[entity]
+        filters = self.parse_tool_json_argument(filters)
+        values = self.parse_tool_json_argument(values)
+        if not isinstance(filters, dict) or not isinstance(values, dict):
+            raise TypeError(
+                "run_update filters and values must be dicts (or JSON strings of objects)",
+            )
         filters = self.coerce_values(cls, dict(filters))
         values = self.coerce_values(cls, values)
 
@@ -452,6 +481,11 @@ class SqlAlchemyAgent(Agent):
     def run_delete(self, entity: str, filters: dict) -> str:
         """Delete rows matching *filters*."""
         cls = self.writable[entity]
+        filters = self.parse_tool_json_argument(filters)
+        if not isinstance(filters, dict):
+            raise TypeError(
+                "run_delete filters must be a dict (or a JSON string of an object)",
+            )
         filters = self.coerce_values(cls, dict(filters))
 
         filters = self.scope_filters_for_mutation(entity, filters)
@@ -485,7 +519,7 @@ class SqlAlchemyAgent(Agent):
         db_context = (
             "Database entities:\n" + "\n".join(entity_lines) + "\n\n" + QUERY_REFERENCE
         )
-        conv.messages[0]["content"] += "\n" + db_context
+        conv.append_system_supplement(db_context)
         return conv
 
     # -- internals ---------------------------------------------------------

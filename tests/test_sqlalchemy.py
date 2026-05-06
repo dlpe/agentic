@@ -77,6 +77,16 @@ class TestRunInsert:
         result = agent.run_insert("Author", {"name": "Tolkien"})
         assert "Inserted" in result and "Author" in result
 
+    def test_accepts_json_string_single_row(self, agent, engine):
+        agent.run_insert("Author", '{"name": "Tolkien"}')
+        with Session(engine) as s:
+            assert s.query(Author).first().name == "Tolkien"
+
+    def test_accepts_json_string_batch(self, agent, engine):
+        agent.run_insert("Author", '[{"name": "A"}, {"name": "B"}]')
+        with Session(engine) as s:
+            assert s.query(Author).count() == 2
+
 
 # -- run_update ------------------------------------------------------------
 
@@ -85,6 +95,16 @@ class TestRunUpdate:
     def test_updates_matching_rows(self, agent, engine):
         agent.run_insert("Author", {"name": "Tolkein"})
         agent.run_update("Author", {"name": "Tolkein"}, {"name": "Tolkien"})
+        with Session(engine) as s:
+            assert s.query(Author).first().name == "Tolkien"
+
+    def test_accepts_json_string_filters_and_values(self, agent, engine):
+        agent.run_insert("Author", {"name": "Tolkein"})
+        agent.run_update(
+            "Author",
+            '{"name": "Tolkein"}',
+            '{"name": "Tolkien"}',
+        )
         with Session(engine) as s:
             assert s.query(Author).first().name == "Tolkien"
 
@@ -109,6 +129,12 @@ class TestRunDelete:
             remaining = s.query(Author).all()
         assert len(remaining) == 1
         assert remaining[0].name == "B"
+
+    def test_accepts_json_string_filters(self, agent, engine):
+        agent.run_insert("Author", {"name": "A"})
+        agent.run_delete("Author", '{"name": "A"}')
+        with Session(engine) as s:
+            assert s.query(Author).count() == 0
 
     def test_returns_count(self, agent):
         agent.run_insert("Author", {"name": "A"})

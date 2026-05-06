@@ -30,11 +30,13 @@ def _seed(engine):
         p2 = Project(id=2, name="Beta", tenant_id=2)
         s.add_all([p1, p2])
         s.flush()
-        s.add_all([
-            Task(id=1, title="Task A1", project_id=1),
-            Task(id=2, title="Task A2", project_id=1),
-            Task(id=3, title="Task B1", project_id=2),
-        ])
+        s.add_all(
+            [
+                Task(id=1, title="Task A1", project_id=1),
+                Task(id=2, title="Task A2", project_id=1),
+                Task(id=3, title="Task B1", project_id=2),
+            ]
+        )
         s.commit()
 
 
@@ -133,24 +135,36 @@ class TestScopeChain:
         a = StubSqlAgent(engine=scoped_engine)
         a.reads(Tenant, scope={"owner_id": "current_user"})
         a.writes(Tenant, scope={"owner_id": "current_user"})
-        a.reads(Project, scope_chain=[
-            ("tenant_id", Tenant),
-            ("owner_id", "current_user"),
-        ])
-        a.writes(Project, scope_chain=[
-            ("tenant_id", Tenant),
-            ("owner_id", "current_user"),
-        ])
-        a.reads(Task, scope_chain=[
-            ("project_id", Project),
-            ("tenant_id", Tenant),
-            ("owner_id", "current_user"),
-        ])
-        a.writes(Task, scope_chain=[
-            ("project_id", Project),
-            ("tenant_id", Tenant),
-            ("owner_id", "current_user"),
-        ])
+        a.reads(
+            Project,
+            scope_chain=[
+                ("tenant_id", Tenant),
+                ("owner_id", "current_user"),
+            ],
+        )
+        a.writes(
+            Project,
+            scope_chain=[
+                ("tenant_id", Tenant),
+                ("owner_id", "current_user"),
+            ],
+        )
+        a.reads(
+            Task,
+            scope_chain=[
+                ("project_id", Project),
+                ("tenant_id", Tenant),
+                ("owner_id", "current_user"),
+            ],
+        )
+        a.writes(
+            Task,
+            scope_chain=[
+                ("project_id", Project),
+                ("tenant_id", Tenant),
+                ("owner_id", "current_user"),
+            ],
+        )
         _seed(scoped_engine)
         return a
 
@@ -219,10 +233,16 @@ class TestPolicy:
             return False
 
         from pygentix.testing import MockAgent
-        agent = MockAgent(responses=[
-            {"content": "", "tool_calls": [{"name": "greet", "arguments": {"name": "X"}}]},
-            {"content": "blocked"},
-        ])
+
+        agent = MockAgent(
+            responses=[
+                {
+                    "content": "",
+                    "tool_calls": [{"name": "greet", "arguments": {"name": "X"}}],
+                },
+                {"content": "blocked"},
+            ]
+        )
 
         @agent.uses
         def greet(name: str) -> str:
@@ -239,10 +259,16 @@ class TestPolicy:
             return True
 
         from pygentix.testing import MockAgent
-        agent = MockAgent(responses=[
-            {"content": "", "tool_calls": [{"name": "greet", "arguments": {"name": "X"}}]},
-            {"content": "Hello X"},
-        ])
+
+        agent = MockAgent(
+            responses=[
+                {
+                    "content": "",
+                    "tool_calls": [{"name": "greet", "arguments": {"name": "X"}}],
+                },
+                {"content": "Hello X"},
+            ]
+        )
 
         @agent.uses
         def greet(name: str) -> str:
@@ -262,10 +288,13 @@ class TestPolicy:
             return True
 
         from pygentix.testing import MockAgent
-        agent = MockAgent(responses=[
-            {"content": "", "tool_calls": [{"name": "noop", "arguments": {}}]},
-            {"content": "done"},
-        ])
+
+        agent = MockAgent(
+            responses=[
+                {"content": "", "tool_calls": [{"name": "noop", "arguments": {}}]},
+                {"content": "done"},
+            ]
+        )
 
         @agent.uses
         def noop() -> str:
@@ -280,10 +309,13 @@ class TestPolicy:
             raise RuntimeError("oops")
 
         from pygentix.testing import MockAgent
-        agent = MockAgent(responses=[
-            {"content": "", "tool_calls": [{"name": "noop", "arguments": {}}]},
-            {"content": "ok"},
-        ])
+
+        agent = MockAgent(
+            responses=[
+                {"content": "", "tool_calls": [{"name": "noop", "arguments": {}}]},
+                {"content": "ok"},
+            ]
+        )
 
         @agent.uses
         def noop() -> str:
@@ -315,7 +347,9 @@ class TestScopeAndPolicy:
         _seed(scoped_engine)
 
         conv = Conversation(
-            a, "test", scope={"current_user": 10}, policy=log_policy,
+            a,
+            scope={"current_user": 10},
+            policy=log_policy,
         )
 
         token = active_scope.set({"current_user": 10})
@@ -336,14 +370,26 @@ class TestScopeAndPolicy:
         _seed(scoped_engine)
 
         from pygentix.core import Conversation as Conv
-        mock = MockAgent(responses=[
-            {"content": "", "tool_calls": [{"name": "run_query", "arguments": {"query_steps": [{"entity": "Tenant"}]}}]},
-            {"content": "denied"},
-        ])
+
+        mock = MockAgent(
+            responses=[
+                {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "name": "run_query",
+                            "arguments": {"query_steps": [{"entity": "Tenant"}]},
+                        }
+                    ],
+                },
+                {"content": "denied"},
+            ]
+        )
         mock.functions = dict(a.functions)
 
         conv = mock.start_conversation(
-            policy=deny_all, scope={"current_user": 10},
+            policy=deny_all,
+            scope={"current_user": 10},
         )
         resp = conv.ask("list tenants")
         tool_msg = [m for m in conv.messages if m["role"] == "tool"]
@@ -374,6 +420,7 @@ class TestNoScope:
 
     def test_conversation_without_scope_or_policy(self):
         from pygentix.testing import MockAgent
+
         agent = MockAgent(responses=[{"content": "hello"}])
         conv = agent.start_conversation()
         assert conv.scope == {}
@@ -388,6 +435,7 @@ class TestNoScope:
 class TestScopeSerialization:
     def test_to_dict_includes_scope(self):
         from pygentix.testing import MockAgent
+
         agent = MockAgent(responses=[])
         conv = agent.start_conversation(scope={"current_user": 5})
         d = conv.to_dict()
@@ -395,6 +443,7 @@ class TestScopeSerialization:
 
     def test_from_dict_restores_scope(self):
         from pygentix.testing import MockAgent
+
         agent = MockAgent(responses=[])
         conv = agent.start_conversation(scope={"current_user": 5})
         data = conv.to_dict()
@@ -405,6 +454,7 @@ class TestScopeSerialization:
 
     def test_to_json_roundtrip(self):
         from pygentix.testing import MockAgent
+
         agent = MockAgent(responses=[])
         conv = agent.start_conversation(scope={"role": "admin"})
         json_str = conv.to_json()

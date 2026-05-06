@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from functools import wraps
 import inspect
 from typing import Any, Callable, Iterator
@@ -18,6 +19,7 @@ __all__ = [
     "Agent",
     "active_scope",
     "active_conversation",
+    "normalize_tool_arguments",
 ]
 
 active_scope: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
@@ -68,8 +70,6 @@ Violations to avoid at all costs:
 
 Remember: the user never sees narration as helpful. They see only the final answer (KIND B) or the side effects of your tool calls (KIND A). Any text that is not the final answer itself is a bug."""
 
-TOOL_NUDGE = "Don't describe what you will do. Call the appropriate tool now."
-
 PYTHON_TO_JSON_TYPE: dict[type, str] = {
     str: "string",
     int: "integer",
@@ -80,6 +80,58 @@ PYTHON_TO_JSON_TYPE: dict[type, str] = {
 }
 
 RETRIABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+
+def normalize_tool_arguments(
+    raw: Any,
+    *,
+    tool_name: str | None = None,
+) -> dict:
+    """Turn provider-native tool arguments into a plain ``dict``.
+
+    All backends should pass tool call payloads through here (via
+    :class:`ChatResponse`) so :class:`Conversation` and :class:`Function`
+    always see the same shape — only wire format adapters differ per vendor.
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, Mapping) and not isinstance(raw, str | bytes | bytearray):
+        return dict(raw)
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if not stripped:
+            return {}
+        if stripped[0] not in "[{":
+            logger.warning(
+                "Tool %r arguments look non-JSON (ignored): %r",
+                tool_name or "?",
+                stripped[:120],
+            )
+            return {}
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "Tool %r arguments JSON parse failed: %s — raw %r",
+                tool_name or "?",
+                exc,
+                stripped[:120],
+            )
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+        logger.warning(
+            "Tool %r arguments JSON must be an object, got %s",
+            tool_name or "?",
+            type(parsed).__name__,
+        )
+        return {}
+    logger.warning(
+        "Tool %r arguments have unexpected type %s",
+        tool_name or "?",
+        type(raw).__name__,
+    )
+    return {}
 
 
 # -- Response types --------------------------------------------------------
@@ -167,7 +219,15 @@ class ChatResponse:
         parsed = None
         if tool_calls:
             parsed = [
-                ToolCall(tc["name"], tc["arguments"], tc.get("id")) for tc in tool_calls
+                ToolCall(
+                    tc["name"],
+                    normalize_tool_arguments(
+                        tc.get("arguments"),
+                        tool_name=tc.get("name"),
+                    ),
+                    tc.get("id"),
+                )
+                for tc in tool_calls
             ]
         self.message = Message(content, parsed)
         self.usage = usage or Usage()
@@ -214,14 +274,25 @@ class Function:
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         scope = active_scope.get() or {}
-        for param_name in self.signature.parameters:
-            if (
-                param_name in scope
-                and param_name not in kwargs
-                and param_name != "self"
-            ):
-                kwargs[param_name] = scope[param_name]
-        result = self.func(*args, **kwargs)
+        merged = dict(kwargs)
+        has_var_kw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in self.signature.parameters.values()
+        )
+        for param_name, param in self.signature.parameters.items():
+            if param_name == "self" or param.kind == inspect.Parameter.VAR_KEYWORD:
+                continue
+            if param_name in scope and param_name not in merged:
+                merged[param_name] = scope[param_name]
+        if not has_var_kw:
+            allowed = {
+                n
+                for n, p in self.signature.parameters.items()
+                if n != "self" and p.kind != inspect.Parameter.VAR_KEYWORD
+            }
+            merged = {k: v for k, v in merged.items() if k in allowed}
+        bound = self.signature.bind_partial(*args, **merged)
+        result = self.func(*bound.args, **bound.kwargs)
         if self._serializer is not None:
             result = self._serializer(result)
         return result
@@ -297,13 +368,18 @@ class Conversation:
 
     Each call to :meth:`ask` runs a three-stage pipeline:
 
-    1. **Prompt** — send the question; retry with a nudge if the model
-       narrates instead of calling a tool.
+    1. **Prompt** — one model call for this user turn (no hidden retries or
+       injected nudge messages).
     2. **Execute** — run every tool the model invokes, looping until it
        stops requesting tools.
-    3. **Format** — if the agent defines an ``output_schema``, make one
-       final call with a ``format`` constraint so the response is
-       guaranteed valid JSON.
+    3. **Format** — if the agent defines an ``output_schema``, optionally
+       re-prompt with a ``format`` constraint when the reply is not already
+       valid JSON (see :meth:`apply_output_schema`).
+
+    The system message is always anchored to :data:`DEFAULT_SYSTEM_PROMPT`.
+    Mixins append context via :meth:`append_system_supplement`; the full
+    system text is recomposed before every model call so accidental edits
+    to ``messages[0]`` cannot replace that policy.
 
     Parameters
     ----------
@@ -325,16 +401,43 @@ class Conversation:
     def __init__(
         self,
         agent: "Agent",
-        system: str,
+        *,
         max_history: int | None = None,
         scope: dict | None = None,
         policy: Callable[..., bool] | None = None,
     ) -> None:
         self.agent = agent
-        self.messages: list[dict] = [{"role": "system", "content": system}]
+        self.system_supplements: list[str] = []
         self.max_history = max_history
         self.scope: dict = scope or {}
         self.policy = policy
+        self.messages: list[dict] = []
+        self.sync_system_message()
+
+    def compose_system_content(self) -> str:
+        """Full system text: locked core plus registered supplements."""
+        parts = [DEFAULT_SYSTEM_PROMPT]
+        parts.extend(s.strip() for s in self.system_supplements if s and s.strip())
+        return "\n\n".join(parts)
+
+    def append_system_supplement(self, text: str) -> None:
+        """Append immutable context (schemas, DB hints) after the locked core."""
+        chunk = (text or "").strip()
+        if not chunk:
+            return
+        self.system_supplements.append(chunk)
+        self.sync_system_message()
+
+    def sync_system_message(self) -> None:
+        """Force ``messages[0]`` to the composed locked system instruction."""
+        payload = {"role": "system", "content": self.compose_system_content()}
+        if not self.messages:
+            self.messages = [payload]
+            return
+        if self.messages[0].get("role") != "system":
+            self.messages.insert(0, payload)
+            return
+        self.messages[0] = payload
 
     # -- serialization -----------------------------------------------------
 
@@ -345,6 +448,7 @@ class Conversation:
         """
         return {
             "messages": list(self.messages),
+            "system_supplements": list(self.system_supplements),
             "max_history": self.max_history,
             "scope": self.scope or None,
         }
@@ -355,9 +459,19 @@ class Conversation:
         conv = cls.__new__(cls)
         conv.agent = agent
         conv.messages = list(data["messages"])
+        conv.system_supplements = list(data.get("system_supplements") or [])
         conv.max_history = data.get("max_history")
         conv.scope = data.get("scope") or {}
         conv.policy = None
+        if not conv.system_supplements and conv.messages:
+            first = conv.messages[0]
+            if first.get("role") == "system":
+                blob = first.get("content") or ""
+                if blob.startswith(DEFAULT_SYSTEM_PROMPT):
+                    tail = blob[len(DEFAULT_SYSTEM_PROMPT) :].strip()
+                    if tail:
+                        conv.system_supplements.append(tail)
+        conv.sync_system_message()
         return conv
 
     def to_json(self) -> str:
@@ -375,8 +489,10 @@ class Conversation:
         """Drop old messages when *max_history* is set, preserving the system prompt."""
         if not self.max_history or len(self.messages) <= self.max_history + 1:
             return
-        system = self.messages[0]
-        self.messages = [system] + self.messages[-self.max_history :]
+        non_system = [m for m in self.messages if m.get("role") != "system"]
+        self.messages = [
+            {"role": "system", "content": self.compose_system_content()}
+        ] + non_system[-self.max_history :]
         logger.debug("Trimmed context to %d messages", len(self.messages))
 
     # -- public API --------------------------------------------------------
@@ -385,7 +501,6 @@ class Conversation:
         self,
         question: str,
         images: list[str] | None = None,
-        max_retries: int = 3,
     ) -> ChatResponse:
         """Send *question* and return the model's response.
 
@@ -393,19 +508,19 @@ class Conversation:
         ----------
         images:
             Optional list of image file paths to include with the question.
-        max_retries:
-            Maximum retries when the model narrates instead of calling a tool.
         """
+        self.sync_system_message()
         msg: dict[str, Any] = {"role": "user", "content": question}
         if images:
             msg["images"] = images
         self.messages.append(msg)
         self.trim_context()
+        self.sync_system_message()
         logger.info("User: %s", question[:120])
 
         scope_token = active_scope.set(self.scope)
         try:
-            response = self.prompt_until_actionable(max_retries)
+            response = self.call_model()
             response = self.execute_tool_calls(response)
             response = self.apply_output_schema(response)
         finally:
@@ -419,7 +534,6 @@ class Conversation:
         self,
         question: str,
         images: list[str] | None = None,
-        max_retries: int = 3,
     ) -> Iterator[str]:
         """Like :meth:`ask` but yields content chunks as they arrive.
 
@@ -428,11 +542,13 @@ class Conversation:
         When tools are registered and the model chooses to call one, the
         tool loop runs non-streaming and the final answer is yielded whole.
         """
+        self.sync_system_message()
         msg: dict[str, Any] = {"role": "user", "content": question}
         if images:
             msg["images"] = images
         self.messages.append(msg)
         self.trim_context()
+        self.sync_system_message()
         logger.info("User (stream): %s", question[:120])
 
         # Snapshot-restore instead of Token.reset(): a streaming generator is
@@ -443,7 +559,7 @@ class Conversation:
         active_scope.set(self.scope)
         try:
             if self.agent.functions:
-                response = self.prompt_until_actionable(max_retries)
+                response = self.call_model()
                 if response.message.tool_calls:
                     response = self.execute_tool_calls(response)
                     yield from self.stream_final()
@@ -463,7 +579,6 @@ class Conversation:
         self,
         question: str,
         images: list[str] | None = None,
-        max_retries: int = 3,
     ) -> ChatResponse:
         """Async version of :meth:`ask`.
 
@@ -472,16 +587,18 @@ class Conversation:
         are executed via ``asyncio.to_thread`` so they don't block the
         event loop.
         """
+        self.sync_system_message()
         msg: dict[str, Any] = {"role": "user", "content": question}
         if images:
             msg["images"] = images
         self.messages.append(msg)
         self.trim_context()
+        self.sync_system_message()
         logger.info("User (async): %s", question[:120])
 
         scope_token = active_scope.set(self.scope)
         try:
-            response = await self.prompt_until_actionable_async(max_retries)
+            response = await self.call_model_async()
             response = await self.execute_tool_calls_async(response)
             response = await self.apply_output_schema_async(response)
         finally:
@@ -493,35 +610,11 @@ class Conversation:
 
     # -- private sync helpers ----------------------------------------------
 
-    def prompt_until_actionable(self, max_retries: int) -> ChatResponse:
-        """Prompt the model, retrying with a nudge if it narrates instead of acting."""
-        for attempt in range(max_retries):
-            response = self.agent.chat(messages=self.messages)
-            self.agent.fire("response", response)
-
-            if response.message.tool_calls:
-                return response
-
-            # Retry with a nudge whenever the model narrates instead of
-            # acting — small local models love to say "I will ..." and
-            # stop there, so non-empty content is still a miss, not a
-            # final answer. The prior-tool-result check keeps us from
-            # nudging a legitimate follow-up answer after a successful
-            # tool turn.
-            should_retry = (
-                attempt < max_retries - 1
-                and self.agent.functions
-                and not self.has_prior_tool_result()
-            )
-            if should_retry:
-                self.messages.append(
-                    {"role": "assistant", "content": response.message.content}
-                )
-                self.messages.append({"role": "user", "content": TOOL_NUDGE})
-            else:
-                return response
-
-        return response  # pragma: no cover — loop always returns
+    def call_model(self) -> ChatResponse:
+        """Single provider call for the current message list (no retries or nudges)."""
+        response = self.agent.chat(messages=self.messages)
+        self.agent.fire("response", response)
+        return response
 
     def check_policy(self, tool_name: str, arguments: dict) -> str | None:
         """Run the policy callback; return an error string if denied, else *None*."""
@@ -597,11 +690,23 @@ class Conversation:
         return response
 
     def apply_output_schema(self, response: ChatResponse) -> ChatResponse:
-        """Re-prompt with a format constraint if the agent defines an output schema."""
+        """Re-prompt with a format constraint if the agent defines an output schema.
+
+        When the last turn is already a JSON object (common after tools), skip a
+        redundant ``chat(..., format=schema)`` call to save a full model round-trip.
+        """
         schema = getattr(self.agent, "output_schema", None)
-        if schema:
-            return self.agent.chat(messages=self.messages, format=schema)
-        return response
+        if not schema:
+            return response
+        text = (response.message.content or "").strip()
+        if text:
+            try:
+                if isinstance(json.loads(text), dict):
+                    return response
+            except json.JSONDecodeError:
+                pass
+            self.messages.append({"role": "assistant", "content": response.message.content})
+        return self.agent.chat(messages=self.messages, format=schema)
 
     def stream_final(self) -> Iterator[str]:
         """Stream the model's response from the current message state."""
@@ -632,31 +737,11 @@ class Conversation:
 
     # -- private async helpers ---------------------------------------------
 
-    async def prompt_until_actionable_async(self, max_retries: int) -> ChatResponse:
-        for attempt in range(max_retries):
-            response = await self.agent.chat_async(messages=self.messages)
-            self.agent.fire("response", response)
-
-            if response.message.tool_calls:
-                return response
-
-            # Mirror the sync path: narration without a tool call is also
-            # a miss on weak models, so nudge rather than accepting text
-            # as the final answer.
-            should_retry = (
-                attempt < max_retries - 1
-                and self.agent.functions
-                and not self.has_prior_tool_result()
-            )
-            if should_retry:
-                self.messages.append(
-                    {"role": "assistant", "content": response.message.content}
-                )
-                self.messages.append({"role": "user", "content": TOOL_NUDGE})
-            else:
-                return response
-
-        return response  # pragma: no cover
+    async def call_model_async(self) -> ChatResponse:
+        """Async single provider call (no retries or nudges)."""
+        response = await self.agent.chat_async(messages=self.messages)
+        self.agent.fire("response", response)
+        return response
 
     async def execute_tool_calls_async(self, response: ChatResponse) -> ChatResponse:
         while response.message.tool_calls:
@@ -709,10 +794,19 @@ class Conversation:
         return response
 
     async def apply_output_schema_async(self, response: ChatResponse) -> ChatResponse:
+        """Async twin of :meth:`apply_output_schema`."""
         schema = getattr(self.agent, "output_schema", None)
-        if schema:
-            return await self.agent.chat_async(messages=self.messages, format=schema)
-        return response
+        if not schema:
+            return response
+        text = (response.message.content or "").strip()
+        if text:
+            try:
+                if isinstance(json.loads(text), dict):
+                    return response
+            except json.JSONDecodeError:
+                pass
+            self.messages.append({"role": "assistant", "content": response.message.content})
+        return await self.agent.chat_async(messages=self.messages, format=schema)
 
 
 # -- Agent -----------------------------------------------------------------
@@ -720,6 +814,13 @@ class Conversation:
 
 class Agent(ABC):
     """Base class for all agents.
+
+    **Single workflow (all vendors):** :class:`Conversation` owns prompting,
+    tool execution, and output formatting. A subclass only
+    implements :meth:`chat` / :meth:`chat_stream` — transport plus parsing into
+    :class:`ChatResponse`. Message shaping for each API lives in that backend's
+    ``prepare_*_messages`` (or equivalent); tool argument coercion to plain dicts
+    is centralized in :func:`normalize_tool_arguments` via :class:`ChatResponse`.
 
     Subclasses must implement :meth:`chat`.  Optionally register tools
     with the :meth:`uses` decorator and start conversations with
@@ -951,10 +1052,9 @@ class Agent(ABC):
     ) -> Conversation:
         """Begin a new conversation.
 
-        The system prompt is always :data:`DEFAULT_SYSTEM_PROMPT` and cannot
-        be overridden. Mixins that need extra context (DB schema, output
-        schema, etc.) append to ``conv.messages[0]["content"]`` after the
-        conversation is built rather than replacing the prompt.
+        The system prompt is always anchored to :data:`DEFAULT_SYSTEM_PROMPT`.
+        Mixins add context via :meth:`Conversation.append_system_supplement`
+        so the locked policy cannot be replaced by accident.
 
         Parameters
         ----------
@@ -970,7 +1070,6 @@ class Agent(ABC):
         """
         conv = Conversation(
             self,
-            DEFAULT_SYSTEM_PROMPT,
             max_history=max_history,
             scope=scope,
             policy=policy,

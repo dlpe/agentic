@@ -94,7 +94,7 @@ def parse_openai_response(choice: Any, usage: Usage | None = None) -> ChatRespon
             {
                 "id": tc.id,
                 "name": tc.function.name,
-                "arguments": json.loads(tc.function.arguments),
+                "arguments": tc.function.arguments,
             }
             for tc in choice.message.tool_calls
         ]

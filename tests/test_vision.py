@@ -7,6 +7,7 @@ Tests cover photo recognition (cats, rainbow) and document parsing (PDF invoice
 rendered to an image via PyMuPDF).
 """
 
+import os
 from pathlib import Path
 
 import pytest
@@ -19,27 +20,7 @@ PHOTO2 = str(TESTS_DIR / "photo2.jpeg")
 PHOTO3 = str(TESTS_DIR / "photo3.jpeg")
 INVOICE_PDF = str(TESTS_DIR / "invoice.pdf")
 
-VISION_MODEL = "llama3.2-vision"
-
-
-def _is_vision_available() -> bool:
-    try:
-        from ollama import list as ollama_list
-
-        response = ollama_list()
-        models = {
-            getattr(m, "model", None) or getattr(m, "name", None)
-            for m in (getattr(response, "models", []) or [])
-        }
-        return any(m.startswith(VISION_MODEL) for m in models if m)
-    except Exception:
-        return False
-
-
-requires_vision = pytest.mark.skipif(
-    not _is_vision_available(),
-    reason=f"Ollama vision model '{VISION_MODEL}' not available",
-)
+VISION_MODEL = os.environ.get("PYGENTIX_OLLAMA_VISION_MODEL", "llama3.2-vision")
 
 
 @pytest.fixture
@@ -47,7 +28,6 @@ def agent():
     return Ollama(model=VISION_MODEL)
 
 
-@requires_vision
 class TestVision:
 
     def test_photo1_cats(self, agent):
@@ -65,9 +45,9 @@ class TestVision:
             images=[PHOTO2],
         )
         answer = response.message.content.lower()
-        assert "3" in answer or "three" in answer, (
-            f"Expected '3' or 'three' in answer: {answer}"
-        )
+        assert (
+            "3" in answer or "three" in answer
+        ), f"Expected '3' or 'three' in answer: {answer}"
 
     def test_photo3_rainbow(self, agent):
         """photo3.jpeg shows a rainbow — the model should mention it."""
@@ -80,6 +60,7 @@ class TestVision:
 # ---------------------------------------------------------------------------
 # PDF document parsing
 # ---------------------------------------------------------------------------
+
 
 def _pdf_to_image(pdf_path: str) -> str:
     """Render the first page of *pdf_path* to a temporary PNG and return its path."""
@@ -94,24 +75,6 @@ def _pdf_to_image(pdf_path: str) -> str:
     return out
 
 
-requires_pymupdf = pytest.mark.skipif(
-    not _is_vision_available(),
-    reason=f"Ollama vision model '{VISION_MODEL}' not available",
-)
-
-try:
-    import fitz  # noqa: F401
-    _has_pymupdf = True
-except ImportError:
-    _has_pymupdf = False
-
-requires_pdf = pytest.mark.skipif(
-    not (_is_vision_available() and _has_pymupdf),
-    reason="Requires both vision model and PyMuPDF (pip install pymupdf)",
-)
-
-
-@requires_pdf
 class TestPDFParsing:
     """Send a rendered PDF invoice to the vision model and verify extraction."""
 
@@ -140,9 +103,9 @@ class TestPDFParsing:
             images=[self.image],
         )
         answer = response.message.content
-        assert "5,454" in answer or "5454" in answer, (
-            f"Expected '$5,454.00' in answer: {answer}"
-        )
+        assert (
+            "5,454" in answer or "5454" in answer
+        ), f"Expected '$5,454.00' in answer: {answer}"
 
     def test_extract_invoice_number(self):
         """The model should read the invoice number."""
@@ -153,9 +116,7 @@ class TestPDFParsing:
             images=[self.image],
         )
         answer = response.message.content.upper()
-        assert "INV-2026-001" in answer, (
-            f"Expected 'INV-2026-001' in answer: {answer}"
-        )
+        assert "INV-2026-001" in answer, f"Expected 'INV-2026-001' in answer: {answer}"
 
     def test_count_line_items(self):
         """The invoice has 5 line items — vision models sometimes miscount by ±1."""
@@ -170,9 +131,9 @@ class TestPDFParsing:
         )
         answer = response.message.content.strip().lower()
         acceptable = {"4", "5", "6", "four", "five", "six"}
-        assert any(v in answer for v in acceptable), (
-            f"Expected 4-6 line items, got: {answer}"
-        )
+        assert any(
+            v in answer for v in acceptable
+        ), f"Expected 4-6 line items, got: {answer}"
 
     def test_extract_client_name(self):
         """The model should identify who the invoice is billed to."""
