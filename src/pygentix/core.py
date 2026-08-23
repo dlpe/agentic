@@ -20,6 +20,8 @@ __all__ = [
     "active_scope",
     "active_conversation",
     "normalize_tool_arguments",
+    "looks_like_plan",
+    "looks_like_finished_answer",
 ]
 
 active_scope: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
@@ -36,39 +38,80 @@ active_conversation: contextvars.ContextVar["Conversation | None"] = (
 
 logger = logging.getLogger("pygentix")
 
-DEFAULT_SYSTEM_PROMPT = """You are a tool-driven agent. Every reply you produce is one of exactly two kinds:
+DEFAULT_SYSTEM_PROMPT = """You are a tool-driven assistant.
 
-KIND A — ACTION: a response whose ONLY payload is one or more tool calls. Its text content MUST be empty. No explanation, no preface, no plan.
-KIND B — FINAL ANSWER: a response with NO tool calls whose text content is the complete, user-facing answer to the original question, already computed from prior tool results.
+Reply in exactly one of two ways:
+- Tool call(s) with empty text, when you still need data or side effects.
+- The complete user-facing answer, when you already have the data.
 
-There is no third kind. Narration is banned.
+Never announce a plan, list next steps, or say what you are about to do. If you need tools, call them now. Greetings and questions that need no tools get a short direct answer."""
 
-A reply is NARRATION (and therefore forbidden) if its text content does any of the following:
-- Says what you are about to do, plan to do, will do, need to do, or should do next.
-- Starts with or contains phrases like "Let me…", "Let's…", "I'll…", "I will…", "I'm going to…", "I need to…", "First I…", "Next I…", "Now I'll…", "To answer this…", "To calculate…", "To do this…", "Here's what I'll do…", "Sure, I'll…", "Okay, I'll…".
-- Ends with a trailing colon (":") that introduces a plan, a step, or data you have not yet produced.
-- Describes the tool, its arguments, the query, or the approach instead of producing the answer.
-- Asks the user for confirmation, clarification, or permission to continue.
-- Emits SQL, pseudo-code, or "I would run X" style explanations in place of calling the tool.
+# One-shot only: the model said it would act and then stopped. Never loop.
+TOOL_NUDGE = "Call the required tool(s) now. Do not describe the plan."
 
-If you catch yourself about to write narration, STOP and emit a tool call instead. The correct way to show intent is to call the tool, not to describe calling it.
+PLAN_MARKERS = (
+    "let me ",
+    "let's ",
+    "i'll ",
+    "i will ",
+    "i am going to ",
+    "i'm going to ",
+    "i need to ",
+    "first i ",
+    "next i ",
+    "now i'll ",
+    "now i will ",
+    "to answer this",
+    "to calculate",
+    "to do this",
+    "here's what i'll",
+    "sure, i'll",
+    "okay, i'll",
+    "we need to ",
+    "we should ",
+    "i would run ",
+)
 
-Decision procedure for every turn:
-1. Do you already have, from tool results in this conversation, every piece of data needed to fully answer the user? If yes, reply with KIND B (final answer only, no narration, no "here is the result:" preface).
-2. Otherwise, reply with KIND A: emit the tool call(s) needed. Text content MUST be empty. Do not announce the call.
+DEFAULT_MAX_TOOL_ROUNDS = 8
 
-Final-answer rules (KIND B):
-- Give the answer directly. No lead-in, no restatement of the question, no "The result is…" unless that is the most natural phrasing of the answer itself.
-- Include the real values returned by the tools. Do not summarize away the data the user asked for.
-- Never output raw SQL, tool names, or tool arguments as the final answer unless the user explicitly asked for them.
-- If after calling tools you still cannot answer, reply with exactly: I cannot answer this question.
 
-Violations to avoid at all costs:
-- Replying "Let me calculate the sum of all opportunity values:" — this is narration. Instead, emit the tool call that computes the sum.
-- Replying "I'll run a query to fetch the data." — this is narration. Emit the query tool call with empty content.
-- Replying "First I need to look up the user, then compute the total." — this is narration. Emit the first tool call with empty content.
+PLAN_OPENING_CHARS = 160
 
-Remember: the user never sees narration as helpful. They see only the final answer (KIND B) or the side effects of your tool calls (KIND A). Any text that is not the final answer itself is a bug."""
+
+def tool_call_fingerprint(name: str, arguments: Any) -> str:
+    return json.dumps(
+        {"name": name, "arguments": arguments},
+        sort_keys=True,
+        default=str,
+    )
+
+
+def looks_like_finished_answer(text: str) -> bool:
+    """True when *text* already delivered the result (link, file, or URL)."""
+    content = text or ""
+    return (
+        "/static/" in content
+        or "download_url" in content
+        or "http://" in content
+        or "https://" in content
+    )
+
+
+def looks_like_plan(text: str) -> bool:
+    """True when the opening of *text* is a plan, not a finished answer."""
+    content = (text or "").strip()
+    if not content or looks_like_finished_answer(content):
+        return False
+    opening = content[:PLAN_OPENING_CHARS]
+    for separator in (". ", "! ", "? ", "\n"):
+        index = opening.find(separator)
+        if index != -1:
+            opening = opening[: index + 1]
+            break
+    lowered = opening.lower().replace("let me know", " ")
+    if any(marker in lowered for marker in PLAN_MARKERS):
+        return True
+    return content.endswith(":") and len(content) < 400
 
 PYTHON_TO_JSON_TYPE: dict[type, str] = {
     str: "string",
@@ -236,6 +279,11 @@ class ChatResponse:
 # -- Function wrapper ------------------------------------------------------
 
 
+# Always omitted from the tool schema so the model cannot pick another tenant,
+# even if schema is built before scope is set.
+IDENTITY_SCOPE_KEYS = frozenset({"enterprise_id", "user_id", "username", "role"})
+
+
 class Function:
     """Introspectable wrapper around a callable, used to expose tools to an LLM.
 
@@ -282,7 +330,7 @@ class Function:
         for param_name, param in self.signature.parameters.items():
             if param_name == "self" or param.kind == inspect.Parameter.VAR_KEYWORD:
                 continue
-            if param_name in scope and param_name not in merged:
+            if param_name in scope:
                 merged[param_name] = scope[param_name]
         if not has_var_kw:
             allowed = {
@@ -324,7 +372,7 @@ class Function:
         """
         properties: dict[str, dict] = {}
         required: list[str] = []
-        scope_keys = set((active_scope.get() or {}).keys())
+        scope_keys = set((active_scope.get() or {}).keys()) | IDENTITY_SCOPE_KEYS
 
         for param_name, param in self.parameters.items():
             if param_name == "self":
@@ -368,10 +416,11 @@ class Conversation:
 
     Each call to :meth:`ask` runs a three-stage pipeline:
 
-    1. **Prompt** — one model call for this user turn (no hidden retries or
-       injected nudge messages).
-    2. **Execute** — run every tool the model invokes, looping until it
-       stops requesting tools.
+        1. **Prompt** — one model call for this user turn. If that reply is
+       "I'll do X" with no tool call, nudge **once** so it actually calls
+       the tool. Never nudge again on that turn.
+        2. **Execute** — run tools until the model stops or
+       :attr:`max_tool_rounds` is hit. Same tool+args is not re-run.
     3. **Format** — if the agent defines an ``output_schema``, optionally
        re-prompt with a ``format`` constraint when the reply is not already
        valid JSON (see :meth:`apply_output_schema`).
@@ -386,6 +435,9 @@ class Conversation:
     max_history:
         When set, keeps only the most recent *N* messages (plus the
         system prompt) to prevent exceeding the model's context window.
+    max_tool_rounds:
+        Cap on tool-call batches per user turn. Prevents an unbounded
+        tool loop from hanging the conversation.
     scope:
         Key-value pairs representing the caller's identity context
         (e.g. ``{"current_user": 5}``).  Passed to
@@ -405,10 +457,13 @@ class Conversation:
         max_history: int | None = None,
         scope: dict | None = None,
         policy: Callable[..., bool] | None = None,
+        max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
     ) -> None:
         self.agent = agent
         self.system_supplements: list[str] = []
         self.max_history = max_history
+        self.max_tool_rounds = max(1, max_tool_rounds)
+        self.turn_tool_cache: dict[str, str] = {}
         self.scope: dict = scope or {}
         self.policy = policy
         self.messages: list[dict] = []
@@ -450,6 +505,7 @@ class Conversation:
             "messages": list(self.messages),
             "system_supplements": list(self.system_supplements),
             "max_history": self.max_history,
+            "max_tool_rounds": self.max_tool_rounds,
             "scope": self.scope or None,
         }
 
@@ -461,6 +517,9 @@ class Conversation:
         conv.messages = list(data["messages"])
         conv.system_supplements = list(data.get("system_supplements") or [])
         conv.max_history = data.get("max_history")
+        conv.max_tool_rounds = max(
+            1, int(data.get("max_tool_rounds") or DEFAULT_MAX_TOOL_ROUNDS)
+        )
         conv.scope = data.get("scope") or {}
         conv.policy = None
         if not conv.system_supplements and conv.messages:
@@ -517,11 +576,11 @@ class Conversation:
         self.trim_context()
         self.sync_system_message()
         logger.info("User: %s", question[:120])
+        self.turn_tool_cache = {}
 
         scope_token = active_scope.set(self.scope)
         try:
-            response = self.call_model()
-            response = self.execute_tool_calls(response)
+            response = self.complete_turn(self.call_model())
             response = self.apply_output_schema(response)
         finally:
             active_scope.reset(scope_token)
@@ -537,10 +596,8 @@ class Conversation:
     ) -> Iterator[str]:
         """Like :meth:`ask` but yields content chunks as they arrive.
 
-        Tool calls are resolved synchronously mid-conversation.  The final
-        text response is streamed via the backend's ``chat_stream`` method.
-        When tools are registered and the model chooses to call one, the
-        tool loop runs non-streaming and the final answer is yielded whole.
+        Each model turn is streamed. Tool calls pause the text stream, run
+        synchronously, then the next model turn streams again.
         """
         self.sync_system_message()
         msg: dict[str, Any] = {"role": "user", "content": question}
@@ -550,6 +607,7 @@ class Conversation:
         self.trim_context()
         self.sync_system_message()
         logger.info("User (stream): %s", question[:120])
+        self.turn_tool_cache = {}
 
         # Snapshot-restore instead of Token.reset(): a streaming generator is
         # resumed by the caller (e.g. Starlette's threadpool) in a different
@@ -558,20 +616,7 @@ class Conversation:
         previous_scope = active_scope.get()
         active_scope.set(self.scope)
         try:
-            if self.agent.functions:
-                response = self.call_model()
-                if response.message.tool_calls:
-                    response = self.execute_tool_calls(response)
-                    yield from self.stream_final()
-                    return
-                response = self.apply_output_schema(response)
-                self.messages.append(
-                    {"role": "assistant", "content": response.message.content}
-                )
-                yield response.message.content
-                return
-
-            yield from self.stream_final()
+            yield from self.stream_complete_turn()
         finally:
             active_scope.set(previous_scope)
 
@@ -595,11 +640,11 @@ class Conversation:
         self.trim_context()
         self.sync_system_message()
         logger.info("User (async): %s", question[:120])
+        self.turn_tool_cache = {}
 
         scope_token = active_scope.set(self.scope)
         try:
-            response = await self.call_model_async()
-            response = await self.execute_tool_calls_async(response)
+            response = await self.complete_turn_async(await self.call_model_async())
             response = await self.apply_output_schema_async(response)
         finally:
             active_scope.reset(scope_token)
@@ -611,10 +656,49 @@ class Conversation:
     # -- private sync helpers ----------------------------------------------
 
     def call_model(self) -> ChatResponse:
-        """Single provider call for the current message list (no retries or nudges)."""
+        """Single provider call for the current message list."""
         response = self.agent.chat(messages=self.messages)
         self.agent.fire("response", response)
         return response
+
+    def should_insist(self, response: ChatResponse) -> bool:
+        """True when the model narrated a plan instead of calling a tool."""
+        if response.message.tool_calls:
+            return False
+        if not self.agent.functions:
+            return False
+        if looks_like_finished_answer(response.message.content):
+            return False
+        return looks_like_plan(response.message.content)
+
+    def complete_turn(self, response: ChatResponse) -> ChatResponse:
+        """Run tools. Nudge at most once if the model announced work and stopped."""
+        already_insisted = self.should_insist(response)
+        if already_insisted:
+            response = self.insist_if_plan(response)
+        response = self.execute_tool_calls(response)
+        if already_insisted:
+            return response
+        response = self.insist_if_plan(response)
+        return self.execute_tool_calls(response)
+
+    def insist_if_plan(self, response: ChatResponse) -> ChatResponse:
+        """Re-prompt once if the reply is a plan with no tool calls.
+
+        Used only so "I'll look that up" does not end the turn empty.
+        The draft and nudge are not kept in history.
+        """
+        if not self.should_insist(response):
+            return response
+        mark = len(self.messages)
+        self.messages.append(
+            {"role": "assistant", "content": response.message.content}
+        )
+        self.messages.append({"role": "user", "content": TOOL_NUDGE})
+        logger.info("Narration without tools; insisting once")
+        retry = self.call_model()
+        del self.messages[mark:]
+        return retry
 
     def check_policy(self, tool_name: str, arguments: dict) -> str | None:
         """Run the policy callback; return an error string if denied, else *None*."""
@@ -640,50 +724,84 @@ class Conversation:
             active_conversation.reset(conv_token)
             active_scope.reset(scope_token)
 
-    def execute_tool_calls(self, response: ChatResponse) -> ChatResponse:
-        """Execute tool calls in a loop until the model stops requesting them."""
-        while response.message.tool_calls:
+    def run_one_tool_round(self, response: ChatResponse) -> None:
+        """Append the tool request and execute each call. Does not call the model."""
+        self.messages.append(
+            {
+                "role": "assistant",
+                "content": response.message.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    }
+                    for tc in response.message.tool_calls
+                ],
+            }
+        )
+
+        for call in response.message.tool_calls:
+            name = call.function.name
+            args = call.function.arguments
+            self.agent.fire("tool_call", name, args)
+            logger.debug("Calling tool %s(%s)", name, args)
+
+            denied = self.check_policy(name, args)
+            cache_key = tool_call_fingerprint(name, args)
+            if denied:
+                result = denied
+            elif cache_key in self.turn_tool_cache:
+                result = self.turn_tool_cache[cache_key]
+            else:
+                try:
+                    result = self.call_tool(name, args)
+                except Exception as exc:
+                    result = f"Tool error: {exc}"
+                self.turn_tool_cache[cache_key] = result
+
+            self.agent.fire("tool_result", name, result)
+            logger.debug("Tool %s → %s", name, result[:200])
             self.messages.append(
                 {
-                    "role": "assistant",
-                    "content": response.message.content,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        }
-                        for tc in response.message.tool_calls
-                    ],
+                    "role": "tool",
+                    "tool_name": name,
+                    "tool_call_id": call.id,
+                    "content": result,
                 }
             )
 
-            for call in response.message.tool_calls:
-                name = call.function.name
-                args = call.function.arguments
-                self.agent.fire("tool_call", name, args)
-                logger.debug("Calling tool %s(%s)", name, args)
-
-                denied = self.check_policy(name, args)
-                if denied:
-                    result = denied
-                else:
-                    try:
-                        result = self.call_tool(name, args)
-                    except Exception as exc:
-                        result = f"Tool error: {exc}"
-
-                self.agent.fire("tool_result", name, result)
-                logger.debug("Tool %s → %s", name, result[:200])
-                self.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_name": name,
-                        "tool_call_id": call.id,
-                        "content": result,
-                    }
+    def execute_tool_calls(self, response: ChatResponse) -> ChatResponse:
+        """Execute tool calls in a loop until the model stops requesting them."""
+        rounds = 0
+        previous_keys: frozenset[str] | None = None
+        while response.message.tool_calls:
+            keys = frozenset(
+                tool_call_fingerprint(call.function.name, call.function.arguments)
+                for call in response.message.tool_calls
+            )
+            if previous_keys is not None and keys == previous_keys:
+                logger.warning("Identical tool calls repeated; stopping tool loop")
+                content = (response.message.content or "").strip()
+                if not content:
+                    content = (
+                        "Stopped after too many tool steps. "
+                        "Try a narrower question."
+                    )
+                return ChatResponse(content=content, usage=response.usage)
+            if rounds >= self.max_tool_rounds:
+                logger.warning(
+                    "Stopped after %d tool rounds", self.max_tool_rounds
                 )
-
+                fallback = (
+                    "Stopped after too many tool steps. "
+                    "Try a narrower question."
+                )
+                content = (response.message.content or "").strip()
+                return ChatResponse(content=content or fallback)
+            rounds += 1
+            previous_keys = keys
+            self.run_one_tool_round(response)
             response = self.agent.chat(messages=self.messages)
             self.agent.fire("response", response)
 
@@ -707,6 +825,102 @@ class Conversation:
                 pass
             self.messages.append({"role": "assistant", "content": response.message.content})
         return self.agent.chat(messages=self.messages, format=schema)
+
+    def stream_complete_turn(self) -> Iterator[str]:
+        """Stream model turns, run tools between them, persist the final text."""
+        response = ChatResponse(content="")
+        parts: list[str] = []
+        insisted = False
+        rounds = 0
+        previous_keys: frozenset[str] | None = None
+
+        def take_turn() -> Iterator[str]:
+            nonlocal response, parts
+            collector: list[ChatResponse] = []
+            parts = []
+            buffered: list[str] = []
+            for chunk in self.agent.stream_chat_turn(self.messages, collector):
+                if not chunk:
+                    continue
+                parts.append(chunk)
+                buffered.append(chunk)
+            response = (
+                collector[-1] if collector else ChatResponse(content="".join(parts))
+            )
+            self.agent.fire("response", response)
+            if not response.message.tool_calls:
+                yield from buffered
+
+        while True:
+            yield from take_turn()
+            if not insisted and self.should_insist(response):
+                insisted = True
+                mark = len(self.messages)
+                self.messages.append(
+                    {"role": "assistant", "content": response.message.content}
+                )
+                self.messages.append({"role": "user", "content": TOOL_NUDGE})
+                logger.info("Narration without tools; insisting once")
+                yield from take_turn()
+                del self.messages[mark:]
+
+            if response.message.tool_calls:
+                keys = frozenset(
+                    tool_call_fingerprint(
+                        call.function.name, call.function.arguments
+                    )
+                    for call in response.message.tool_calls
+                )
+                if previous_keys is not None and keys == previous_keys:
+                    logger.warning("Identical tool calls repeated; stopping tool loop")
+                    content = "".join(parts).strip()
+                    if content:
+                        yield content
+                        self.messages.append({"role": "assistant", "content": content})
+                    return
+                if rounds >= self.max_tool_rounds:
+                    logger.warning(
+                        "Stopped after %d tool rounds", self.max_tool_rounds
+                    )
+                    content = "".join(parts).strip()
+                    if not content:
+                        fallback = (
+                            "Stopped after too many tool steps. "
+                            "Try a narrower question."
+                        )
+                        yield fallback
+                        self.messages.append(
+                            {"role": "assistant", "content": fallback}
+                        )
+                    else:
+                        self.messages.append(
+                            {"role": "assistant", "content": "".join(parts)}
+                        )
+                    return
+                self.run_one_tool_round(response)
+                previous_keys = keys
+                rounds += 1
+                continue
+
+            content = "".join(parts) or (response.message.content or "")
+            boxed = ChatResponse(
+                content=content,
+                usage=response.usage,
+            )
+            boxed = self.apply_output_schema(boxed)
+            extra = boxed.message.content or ""
+            if extra and extra != content:
+                if extra.startswith(content):
+                    tail = extra[len(content) :]
+                    if tail:
+                        yield tail
+                else:
+                    yield extra
+            self.messages.append(
+                {"role": "assistant", "content": boxed.message.content}
+            )
+            logger.info("Assistant (stream): %s", (boxed.message.content or "")[:120])
+            return
 
     def stream_final(self) -> Iterator[str]:
         """Stream the model's response from the current message state."""
@@ -738,58 +952,67 @@ class Conversation:
     # -- private async helpers ---------------------------------------------
 
     async def call_model_async(self) -> ChatResponse:
-        """Async single provider call (no retries or nudges)."""
+        """Async single provider call."""
         response = await self.agent.chat_async(messages=self.messages)
         self.agent.fire("response", response)
         return response
 
+    async def insist_if_plan_async(self, response: ChatResponse) -> ChatResponse:
+        """Async twin of :meth:`insist_if_plan`."""
+        if not self.should_insist(response):
+            return response
+        mark = len(self.messages)
+        self.messages.append(
+            {"role": "assistant", "content": response.message.content}
+        )
+        self.messages.append({"role": "user", "content": TOOL_NUDGE})
+        logger.info("Narration without tools; insisting once")
+        retry = await self.call_model_async()
+        del self.messages[mark:]
+        return retry
+
+    async def complete_turn_async(self, response: ChatResponse) -> ChatResponse:
+        """Async twin of :meth:`complete_turn`."""
+        already_insisted = self.should_insist(response)
+        if already_insisted:
+            response = await self.insist_if_plan_async(response)
+        response = await self.execute_tool_calls_async(response)
+        if already_insisted:
+            return response
+        response = await self.insist_if_plan_async(response)
+        return await self.execute_tool_calls_async(response)
+
     async def execute_tool_calls_async(self, response: ChatResponse) -> ChatResponse:
+        rounds = 0
+        previous_keys: frozenset[str] | None = None
         while response.message.tool_calls:
-            self.messages.append(
-                {
-                    "role": "assistant",
-                    "content": response.message.content,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        }
-                        for tc in response.message.tool_calls
-                    ],
-                }
+            keys = frozenset(
+                tool_call_fingerprint(call.function.name, call.function.arguments)
+                for call in response.message.tool_calls
             )
-
-            for call in response.message.tool_calls:
-                name = call.function.name
-                args = call.function.arguments
-                self.agent.fire("tool_call", name, args)
-                logger.debug("Calling tool %s(%s)", name, args)
-
-                denied = self.check_policy(name, args)
-                if denied:
-                    result = denied
-                else:
-                    try:
-                        result = str(
-                            await asyncio.to_thread(self.call_tool, name, args)
-                        )
-                    except Exception as exc:
-                        result = f"Tool error: {exc}"
-
-                self.agent.fire("tool_result", name, result)
-                logger.debug("Tool %s → %s", name, result[:200])
-                self.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_name": name,
-                        "tool_call_id": call.id,
-                        "content": result,
-                    }
+            if previous_keys is not None and keys == previous_keys:
+                logger.warning("Identical tool calls repeated; stopping tool loop")
+                content = (response.message.content or "").strip()
+                if not content:
+                    content = (
+                        "Stopped after too many tool steps. "
+                        "Try a narrower question."
+                    )
+                return ChatResponse(content=content, usage=response.usage)
+            if rounds >= self.max_tool_rounds:
+                logger.warning(
+                    "Stopped after %d tool rounds", self.max_tool_rounds
                 )
-
-            response = await self.agent.chat_async(messages=self.messages)
-            self.agent.fire("response", response)
+                fallback = (
+                    "Stopped after too many tool steps. "
+                    "Try a narrower question."
+                )
+                content = (response.message.content or "").strip()
+                return ChatResponse(content=content or fallback)
+            rounds += 1
+            previous_keys = keys
+            self.run_one_tool_round(response)
+            response = await self.call_model_async()
 
         return response
 
@@ -1031,7 +1254,37 @@ class Agent(ABC):
         from :meth:`chat`.
         """
         response = self.chat(messages, **kwargs)
-        yield response.message.content
+        if response.message.content:
+            yield response.message.content
+
+    def stream_chat_turn(
+        self,
+        messages: list[dict],
+        collector: list | None = None,
+        **kwargs: Any,
+    ) -> Iterator[str]:
+        """Yield text deltas and store the completed :class:`ChatResponse`.
+
+        *collector* receives the parsed response so a streaming caller can
+        see tool calls without storing state on the shared agent instance.
+        Backends that stream natively should override this (not only
+        :meth:`chat_stream`) so tool_use survives the stream.
+        """
+        if not self.functions:
+            parts: list[str] = []
+            for chunk in self.chat_stream(messages, **kwargs):
+                if not chunk:
+                    continue
+                parts.append(chunk)
+                yield chunk
+            if collector is not None:
+                collector.append(ChatResponse(content="".join(parts)))
+            return
+        response = self.chat(messages, **kwargs)
+        if collector is not None:
+            collector.append(response)
+        if response.message.content:
+            yield response.message.content
 
     async def chat_async(self, messages: list[dict], **kwargs: Any) -> ChatResponse:
         """Async chat.
@@ -1049,6 +1302,7 @@ class Agent(ABC):
         max_history: int | None = None,
         scope: dict | None = None,
         policy: Callable[..., bool] | None = None,
+        max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
     ) -> Conversation:
         """Begin a new conversation.
 
@@ -1073,6 +1327,7 @@ class Agent(ABC):
             max_history=max_history,
             scope=scope,
             policy=policy,
+            max_tool_rounds=max_tool_rounds,
         )
         if prompt:
             conv.messages.append({"role": "user", "content": prompt})

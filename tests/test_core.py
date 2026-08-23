@@ -2,7 +2,14 @@
 
 from unittest.mock import MagicMock
 
-from pygentix.core import ChatResponse, Conversation, Function
+from pygentix.core import (
+    ChatResponse,
+    Conversation,
+    Function,
+    active_scope,
+    looks_like_finished_answer,
+    looks_like_plan,
+)
 
 
 # -- Function --------------------------------------------------------------
@@ -35,6 +42,26 @@ class TestFunction:
             return None
 
         assert repr(Function(example)) == "Function(example)"
+
+    def test_scope_overwrites_model_supplied_enterprise_id(self):
+        def list_rows(enterprise_id: str) -> str:
+            return enterprise_id
+
+        f = Function(list_rows)
+        token = active_scope.set({"enterprise_id": "current-ent"})
+        try:
+            assert f(enterprise_id="other-ent") == "current-ent"
+        finally:
+            active_scope.reset(token)
+
+    def test_enterprise_id_hidden_from_schema_without_scope(self):
+        def list_rows(enterprise_id: str, limit: int = 10) -> str:
+            return enterprise_id
+
+        schema = Function(list_rows).to_tool_schema()
+        props = schema["function"]["parameters"]["properties"]
+        assert "enterprise_id" not in props
+        assert "limit" in props
 
 
 # -- Conversation.has_prior_tool_result ------------------------------------
@@ -107,24 +134,42 @@ class TestConversationPrompting:
         assert resp.message.content == "answer"
         assert mock_agent.chat.call_count == 1
 
-    def test_single_prompt_when_model_narrates_without_tools(self):
+    def test_single_insist_when_model_narrates_without_tools(self):
         mock_agent = MagicMock()
         mock_agent.output_schema = None
         mock_agent.functions = {"tool": lambda: "ok"}
-        mock_agent.chat.return_value = self.make_mock_response(content="I will...")
+        mock_agent.chat.side_effect = [
+            self.make_mock_response(content="I will look that up."),
+            self.make_mock_response(content="3 open opportunities"),
+        ]
 
         conv = Conversation(mock_agent)
         conv.ask("do it")
-        assert mock_agent.chat.call_count == 1
+        assert mock_agent.chat.call_count == 2
         assert not any(
-            "Don't describe" in str(m.get("content", "")) for m in conv.messages
+            "Call the required tool" in str(m.get("content", "")) for m in conv.messages
         )
+        assert conv.messages[-1]["content"] == "3 open opportunities"
 
-    def test_single_prompt_after_prior_tool_messages(self):
+    def test_no_insist_on_finished_answer(self):
         mock_agent = MagicMock()
         mock_agent.output_schema = None
         mock_agent.functions = {"tool": lambda: "ok"}
-        mock_agent.chat.return_value = self.make_mock_response(content="Let me think...")
+        mock_agent.chat.return_value = self.make_mock_response(
+            content="You have 3 opportunities."
+        )
+
+        conv = Conversation(mock_agent)
+        conv.ask("how many?")
+        assert mock_agent.chat.call_count == 1
+
+    def test_no_insist_on_finished_answer_after_prior_tool_messages(self):
+        mock_agent = MagicMock()
+        mock_agent.output_schema = None
+        mock_agent.functions = {"tool": lambda: "ok"}
+        mock_agent.chat.return_value = self.make_mock_response(
+            content="Based on the earlier data, the total is 10."
+        )
 
         conv = Conversation(mock_agent)
         conv.messages.append({"role": "user", "content": "first"})
@@ -136,7 +181,7 @@ class TestConversationPrompting:
         conv.ask("new question")
         assert mock_agent.chat.call_count == 1
         assert not any(
-            "Don't describe" in str(m.get("content", "")) for m in conv.messages
+            "Call the required tool" in str(m.get("content", "")) for m in conv.messages
         )
 
     def test_final_response_is_recorded_in_history(self):
@@ -173,3 +218,137 @@ class TestApplyOutputSchemaShortcut:
         mock_agent.chat.assert_called_once()
         assert conv.messages[-1]["content"] == "thinking aloud"
         assert out.message.content == '{"answer":"ok","data":[]}'
+
+
+class TestLooksLikePlan:
+    def test_detects_plan_phrases(self):
+        assert looks_like_plan("I will fetch the invoices next.")
+        assert looks_like_plan("We need to do A, B and C")
+        assert looks_like_plan("Let me look that up:")
+
+    def test_ignores_finished_answers(self):
+        assert looks_like_plan("You have 3 opportunities.") is False
+        assert looks_like_plan("hello") is False
+        assert looks_like_plan("") is False
+        assert looks_like_plan(
+            "Your Excel file is ready! Let me know if you'd like to filter."
+        ) is False
+        assert looks_like_plan(
+            "Your Excel file is ready.\nI'll include Sale Date and Client."
+        ) is False
+        assert looks_like_finished_answer(
+            "Download /static/chat_files/sold.xlsx"
+        ) is True
+
+
+class TestInsistAfterTools:
+    def test_insists_when_model_plans_after_a_tool_result(self):
+        mock_agent = MagicMock()
+        mock_agent.output_schema = None
+        tool_call = MagicMock()
+        tool_call.id = "c1"
+        tool_call.function.name = "tool"
+        tool_call.function.arguments = {}
+        first = MagicMock()
+        first.message.content = ""
+        first.message.tool_calls = [tool_call]
+        after_tool = MagicMock()
+        after_tool.message.content = "Now I need to sum the values."
+        after_tool.message.tool_calls = None
+        final = MagicMock()
+        final.message.content = "The total is 10."
+        final.message.tool_calls = None
+        mock_agent.chat.side_effect = [first, after_tool, final]
+        mock_agent.functions = {"tool": lambda: "ok"}
+
+        conv = Conversation(mock_agent)
+        resp = conv.ask("total?")
+        assert mock_agent.chat.call_count == 3
+        assert resp.message.content == "The total is 10."
+        assert not any(
+            "Call the required tool" in str(m.get("content", "")) for m in conv.messages
+        )
+
+    def test_insists_at_most_once_per_turn(self):
+        mock_agent = MagicMock()
+        mock_agent.output_schema = None
+        tool_call = MagicMock()
+        tool_call.id = "c1"
+        tool_call.function.name = "tool"
+        tool_call.function.arguments = {}
+        announced = MagicMock()
+        announced.message.content = "I will fetch the invoices next."
+        announced.message.tool_calls = None
+        with_tool = MagicMock()
+        with_tool.message.content = ""
+        with_tool.message.tool_calls = [tool_call]
+        announced_again = MagicMock()
+        announced_again.message.content = "I will format the file next."
+        announced_again.message.tool_calls = None
+        unused = MagicMock()
+        unused.message.content = "should not run"
+        unused.message.tool_calls = None
+        mock_agent.chat.side_effect = [
+            announced,
+            with_tool,
+            announced_again,
+            unused,
+        ]
+        mock_agent.functions = {"tool": lambda: "ok"}
+
+        conv = Conversation(mock_agent)
+        resp = conv.ask("invoices?")
+        assert mock_agent.chat.call_count == 3
+        assert resp.message.content == "I will format the file next."
+
+
+class TestMaxToolRounds:
+    def test_stops_unbounded_tool_loop(self):
+        mock_agent = MagicMock()
+        mock_agent.output_schema = None
+
+        def looping_response(*_args, **_kwargs):
+            tool_call = MagicMock()
+            tool_call.id = "c1"
+            tool_call.function.name = "tool"
+            tool_call.function.arguments = {"n": mock_agent.chat.call_count}
+            response = MagicMock()
+            response.message.content = ""
+            response.message.tool_calls = [tool_call]
+            return response
+
+        mock_agent.chat.side_effect = looping_response
+        mock_agent.functions = {"tool": lambda n=0: "ok"}
+
+        conv = Conversation(mock_agent, max_tool_rounds=2)
+        resp = conv.ask("loop")
+        assert mock_agent.chat.call_count == 3
+        assert "too many tool steps" in resp.message.content
+
+
+class TestRepeatedToolCalls:
+    def test_same_tool_args_do_not_run_twice(self):
+        calls = {"n": 0}
+        mock_agent = MagicMock()
+        mock_agent.output_schema = None
+        tool_call = MagicMock()
+        tool_call.id = "c1"
+        tool_call.function.name = "export"
+        tool_call.function.arguments = {}
+        first = MagicMock()
+        first.message.content = "Your file: /static/chat_files/a.xlsx"
+        first.message.tool_calls = [tool_call]
+        again = MagicMock()
+        again.message.content = "Your file: /static/chat_files/a.xlsx I'll add more."
+        again.message.tool_calls = [tool_call]
+        mock_agent.chat.side_effect = [first, again]
+
+        def export() -> str:
+            calls["n"] += 1
+            return "/static/chat_files/a.xlsx"
+
+        mock_agent.functions = {"export": export}
+        conv = Conversation(mock_agent)
+        resp = conv.ask("export")
+        assert calls["n"] == 1
+        assert "/static/chat_files/a.xlsx" in resp.message.content

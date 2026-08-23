@@ -67,9 +67,23 @@ class MockAgent(Agent):
     def chat(self, messages: list[dict], **kwargs: Any) -> ChatResponse:
         return self.next_response()
 
-    def chat_stream(self, messages: list[dict], **kwargs: Any) -> Iterator[str]:
-        """Yield the next response one word at a time to simulate streaming."""
+    def stream_chat_turn(
+        self,
+        messages: list[dict],
+        collector: list | None = None,
+        **kwargs: Any,
+    ) -> Iterator[str]:
+        """Yield the next response one word at a time; keep tool_calls."""
         response = self.next_response()
-        words = response.message.content.split(" ")
+        if collector is not None:
+            collector.append(response)
+        content = response.message.content or ""
+        if not content:
+            return
+        words = content.split(" ")
         for i, word in enumerate(words):
             yield word if i == len(words) - 1 else word + " "
+
+    def chat_stream(self, messages: list[dict], **kwargs: Any) -> Iterator[str]:
+        """Yield the next response one word at a time to simulate streaming."""
+        yield from self.stream_chat_turn(messages, **kwargs)

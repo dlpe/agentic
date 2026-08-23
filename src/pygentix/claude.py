@@ -13,6 +13,11 @@ __all__ = ["Claude"]
 
 logger = logging.getLogger("pygentix")
 
+# Anthropic prompt cache: tools → system → messages. A breakpoint on the last
+# stable block lets later turns read that prefix at ~10% input cost.
+STABLE_PROMPT_CACHE = {"type": "ephemeral", "ttl": "1h"}
+TURN_PROMPT_CACHE = {"type": "ephemeral"}
+
 
 def prepare_claude_messages(messages: list[dict]) -> tuple[str, list[dict]]:
     """Split internal messages into an Anthropic system string + message list.
@@ -140,6 +145,76 @@ def convert_tools_for_claude(functions: dict) -> list[dict] | None:
     return tools
 
 
+def cached_system_blocks(system: str) -> list[dict] | str:
+    """Wrap the system prompt so Anthropic can cache it across calls."""
+    text = (system or "").strip()
+    if not text:
+        return system
+    return [
+        {
+            "type": "text",
+            "text": text,
+            "cache_control": dict(STABLE_PROMPT_CACHE),
+        }
+    ]
+
+
+def mark_tools_cached(tools: list[dict] | None) -> list[dict] | None:
+    """Put a cache breakpoint on the last tool (caches the whole tool list)."""
+    if not tools:
+        return tools
+    marked = [dict(tool) for tool in tools]
+    marked[-1] = {**marked[-1], "cache_control": dict(STABLE_PROMPT_CACHE)}
+    return marked
+
+
+def mark_messages_cached(messages: list[dict]) -> list[dict]:
+    """Mark the last content block so growing history can be reread from cache."""
+    if not messages:
+        return messages
+    result = list(messages)
+    last = dict(result[-1])
+    content = last.get("content")
+    if isinstance(content, str):
+        last["content"] = [
+            {
+                "type": "text",
+                "text": content,
+                "cache_control": dict(TURN_PROMPT_CACHE),
+            }
+        ]
+    elif isinstance(content, list) and content:
+        blocks = [dict(block) for block in content]
+        blocks[-1] = {**blocks[-1], "cache_control": dict(TURN_PROMPT_CACHE)}
+        last["content"] = blocks
+    result[-1] = last
+    return result
+
+
+def build_claude_request(
+    messages: list[dict],
+    functions: dict,
+    *,
+    prompt_cache: bool = True,
+) -> dict[str, Any]:
+    """Shape system, messages, and tools for ``messages.create`` / ``stream``."""
+    system, claude_messages = prepare_claude_messages(messages)
+    tools = convert_tools_for_claude(functions)
+    if prompt_cache:
+        tools = mark_tools_cached(tools)
+        claude_messages = mark_messages_cached(claude_messages)
+        system_arg: Any = cached_system_blocks(system)
+    else:
+        system_arg = system
+    payload: dict[str, Any] = {
+        "system": system_arg,
+        "messages": claude_messages,
+    }
+    if tools:
+        payload["tools"] = tools
+    return payload
+
+
 def parse_claude_response(response: Any) -> ChatResponse:
     """Convert an Anthropic Message into a pygentix ChatResponse."""
     text_parts: list[str] = []
@@ -179,21 +254,26 @@ class Claude(Agent):
     Parameters
     ----------
     model:
-        Model identifier. Defaults to ``"claude-sonnet-4-20250514"``.
+        Model identifier. Defaults to ``"claude-sonnet-4-6"``.
     api_key:
         Anthropic API key. Falls back to ``ANTHROPIC_API_KEY`` env var.
     temperature:
         Sampling temperature. Defaults to ``0``.
     max_tokens:
         Maximum tokens in the response. Defaults to ``4096``.
+    prompt_cache:
+        When True (default), attach Anthropic ``cache_control`` breakpoints
+        on tools, the system prompt, and the last message. Set
+        ``ANTHROPIC_PROMPT_CACHE=0`` to disable.
     """
 
     def __init__(
         self,
-        model: str = "claude-sonnet-4-20250514",
+        model: str = "claude-sonnet-4-6",
         *,
         api_key: str | None = None,
         max_tokens: int = 4096,
+        prompt_cache: bool | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -201,6 +281,10 @@ class Claude(Agent):
         self.max_tokens = max_tokens
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
         self.client: Any = None
+        if prompt_cache is None:
+            raw = os.environ.get("ANTHROPIC_PROMPT_CACHE", "1").strip().lower()
+            prompt_cache = raw not in {"0", "false", "no", "off"}
+        self.prompt_cache = prompt_cache
 
     def ensure_client(self) -> Any:
         """Return the Anthropic client, creating it on first use."""
@@ -213,37 +297,46 @@ class Claude(Agent):
     def chat(self, messages: list[dict], **kwargs: Any) -> ChatResponse:
         """Forward messages to the Anthropic API and return a ChatResponse."""
         client = self.ensure_client()
-        system, claude_messages = prepare_claude_messages(messages)
-        tools = convert_tools_for_claude(self.functions)
-
-        extra: dict[str, Any] = {}
-        if tools:
-            extra["tools"] = tools
+        request = build_claude_request(
+            messages, self.functions, prompt_cache=self.prompt_cache
+        )
 
         def do_call() -> Any:
             return client.messages.create(
                 model=self.model,
-                system=system,
-                messages=claude_messages,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
-                **extra,
+                **request,
             )
 
         response = self.with_retry(do_call)
         return parse_claude_response(response)
 
-    def chat_stream(self, messages: list[dict], **kwargs: Any) -> Iterator[str]:
-        """Yield content chunks via Anthropic's native streaming."""
+    def stream_chat_turn(
+        self,
+        messages: list[dict],
+        collector: list | None = None,
+        **kwargs: Any,
+    ) -> Iterator[str]:
+        """Yield text deltas; keep tool_use from the completed stream message."""
         client = self.ensure_client()
-        system, claude_messages = prepare_claude_messages(messages)
+        request = build_claude_request(
+            messages, self.functions, prompt_cache=self.prompt_cache
+        )
 
         with client.messages.stream(
             model=self.model,
-            system=system,
-            messages=claude_messages,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            **request,
         ) as stream:
             for text in stream.text_stream:
-                yield text
+                if text:
+                    yield text
+            response = parse_claude_response(stream.get_final_message())
+        if collector is not None:
+            collector.append(response)
+
+    def chat_stream(self, messages: list[dict], **kwargs: Any) -> Iterator[str]:
+        """Yield content chunks via Anthropic's native streaming."""
+        yield from self.stream_chat_turn(messages, **kwargs)

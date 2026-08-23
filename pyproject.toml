@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pygentix"
-version = "0.1.7"
+version = "0.1.9"
 description = "Composable AI agent framework — drop-in LLM tool-calling, structured output, and SQLAlchemy integration for any Python project."
 authors = [
     { name = "Andre Perussi", email = "dlperussi@hotmail.com" },
